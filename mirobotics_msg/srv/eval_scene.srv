@@ -1,0 +1,5 @@
+string model_path
+---
+bool success
+string error_msg
+string json_objects

@@ -1,0 +1,7 @@
+float64[3] start
+float64[3] goal
+string json_point_cloud
+---
+bool success
+string error_msg
+string json_path
