@@ -5,7 +5,7 @@ from launch_ros.actions import Node
 def generate_launch_description():
     return LaunchDescription([
         Node(
-            package='scene_eval',
+            package='mirobotics_scene_eval',
             executable='scene_eval_server',
             name='scene_eval_server',
             output='screen',

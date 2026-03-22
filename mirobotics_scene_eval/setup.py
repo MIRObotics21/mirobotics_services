@@ -27,7 +27,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'scene_eval_server = scene_eval.scene_eval_server:main',
+            'scene_eval_server = mirobotics_scene_eval.scene_eval_server:main',
         ],
     },
 )

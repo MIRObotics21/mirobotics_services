@@ -4,6 +4,9 @@ from typing import Optional
 
 import rclpy
 from rclpy.node import Node
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge, CvBridgeError
 
@@ -13,6 +16,7 @@ from mirobotics_msg.srv import EvalScene
 class SceneEvalServer(Node):
     def __init__(self) -> None:
         super().__init__('scene_eval_server')
+        self._cb_group = ReentrantCallbackGroup()
 
         self.declare_parameter('timeout_sec', 5.0)
         self.declare_parameter('default_model_path', '')
@@ -28,12 +32,14 @@ class SceneEvalServer(Node):
             'image',
             self._image_callback,
             10,
+            callback_group=self._cb_group,
         )
 
         self._service = self.create_service(
             EvalScene,
             '/mirobotics_scene_eval/mirobotics_eval_scene',
             self._handle_eval_scene,
+            callback_group=self._cb_group,
         )
 
         self.get_logger().info('SceneEvalServer ready on /mirobotics_scene_eval/mirobotics_eval_scene')
@@ -61,7 +67,7 @@ class SceneEvalServer(Node):
         if not model_path:
             response.success = False
             response.error_msg = 'No model_path provided in request and default_model_path parameter is empty.'
-            response.objects_json = '[]'
+            response.json_objects = '[]'
             return response
 
         self.get_logger().info(f'Received scene evaluation request with model_path="{model_path}"')
@@ -70,7 +76,7 @@ class SceneEvalServer(Node):
         if image_msg is None:
             response.success = False
             response.error_msg = f'Timeout waiting for one image on topic "image" after {timeout_sec:.2f} s.'
-            response.objects_json = '[]'
+            response.json_objects = '[]'
             return response
 
         try:
@@ -78,7 +84,7 @@ class SceneEvalServer(Node):
         except CvBridgeError as exc:
             response.success = False
             response.error_msg = f'Failed to convert ROS image to OpenCV image: {exc}'
-            response.objects_json = '[]'
+            response.json_objects = '[]'
             return response
 
         try:
@@ -86,13 +92,13 @@ class SceneEvalServer(Node):
         except Exception as exc:
             response.success = False
             response.error_msg = f'Scene evaluation failed: {exc}'
-            response.objects_json = '[]'
+            response.json_objects = '[]'
             self.get_logger().error(response.error_msg)
             return response
 
         response.success = True
         response.error_msg = ''
-        response.objects_json = json.dumps(objects)
+        response.json_objects = json.dumps(objects)
         self.get_logger().info(f'Scene evaluation succeeded. Returned {len(objects)} object(s).')
         return response
 
@@ -124,7 +130,9 @@ def main(args=None) -> None:
     rclpy.init(args=args)
     node = SceneEvalServer()
     try:
-        rclpy.spin(node)
+        executor = MultiThreadedExecutor()
+        executor.add_node(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
