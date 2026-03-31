@@ -129,12 +129,23 @@ class SceneEvalServer(Node):
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = SceneEvalServer()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+
     try:
-        executor = MultiThreadedExecutor()
-        executor.add_node(node)
         executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        try:
+            executor.shutdown()
+        except Exception:
+            pass
+
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+
+        if rclpy.ok():
+            rclpy.shutdown()
