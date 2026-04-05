@@ -10,22 +10,28 @@ from rclpy.executors import MultiThreadedExecutor
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge, CvBridgeError
 
+from ultralytics import YOLO
+
 from mirobotics_msg.srv import EvalScene
 
 
 class SceneEvalServer(Node):
     def __init__(self) -> None:
         super().__init__('scene_eval_server')
-        self._cb_group = ReentrantCallbackGroup()
 
         self.declare_parameter('timeout_sec', 5.0)
         self.declare_parameter('default_model_path', '')
-        self.declare_parameter('min_confidence', 0.5)
+        self.declare_parameter('min_confidence', 0.25)
         self.declare_parameter('max_detections', 50)
 
         self._bridge = CvBridge()
         self._latest_image_msg: Optional[Image] = None
         self._image_event = threading.Event()
+
+        self._model = None
+        self._loaded_model_path: Optional[str] = None
+
+        self._cb_group = ReentrantCallbackGroup()
 
         self._image_sub = self.create_subscription(
             Image,
@@ -42,7 +48,9 @@ class SceneEvalServer(Node):
             callback_group=self._cb_group,
         )
 
-        self.get_logger().info('SceneEvalServer ready on /mirobotics_scene_eval/mirobotics_eval_scene')
+        self.get_logger().info(
+            'SceneEvalServer ready on /mirobotics_scene_eval/mirobotics_eval_scene'
+        )
 
     def _image_callback(self, msg: Image) -> None:
         self._latest_image_msg = msg
@@ -58,6 +66,13 @@ class SceneEvalServer(Node):
 
         return self._latest_image_msg
 
+    def _get_model(self, model_path: str) -> YOLO:
+        if self._model is None or self._loaded_model_path != model_path:
+            self.get_logger().info(f'Loading YOLO model from: {model_path}')
+            self._model = YOLO(model_path)
+            self._loaded_model_path = model_path
+        return self._model
+
     def _handle_eval_scene(self, request: EvalScene.Request, response: EvalScene.Response):
         timeout_sec = float(self.get_parameter('timeout_sec').value)
         default_model_path = str(self.get_parameter('default_model_path').value)
@@ -66,7 +81,9 @@ class SceneEvalServer(Node):
 
         if not model_path:
             response.success = False
-            response.error_msg = 'No model_path provided in request and default_model_path parameter is empty.'
+            response.error_msg = (
+                'No model_path provided in request and default_model_path parameter is empty.'
+            )
             response.json_objects = '[]'
             return response
 
@@ -75,7 +92,9 @@ class SceneEvalServer(Node):
         image_msg = self._wait_for_one_image(timeout_sec)
         if image_msg is None:
             response.success = False
-            response.error_msg = f'Timeout waiting for one image on topic "image" after {timeout_sec:.2f} s.'
+            response.error_msg = (
+                f'Timeout waiting for one image on topic "image" after {timeout_sec:.2f} s.'
+            )
             response.json_objects = '[]'
             return response
 
@@ -104,25 +123,61 @@ class SceneEvalServer(Node):
 
     def _evaluate_scene(self, model_path: str, cv_image):
         """
-        Placeholder for your actual model inference.
-
-        Return value must be a JSON-serializable Python list, for example:
+        Return a JSON-serializable Python list:
         [
-            {"id": 1, "type": "apple", "u": 320.0, "v": 240.0},
-            {"id": 2, "type": "banana", "u": 100.0, "v": 200.0}
-        ]
-        """
-        height, width = cv_image.shape[:2]
-
-        # Temporary dummy output so the service can be tested end-to-end.
-        objects = [
             {
                 "id": 1,
-                "type": "dummy_object",
-                "u": float(width / 2.0),
-                "v": float(height / 2.0),
+                "type": "yellow",
+                "u": 320.0,
+                "v": 240.0,
+                "confidence": 0.91
             }
         ]
+        """
+        model = self._get_model(model_path)
+
+        min_confidence = float(self.get_parameter('min_confidence').value)
+        max_detections = int(self.get_parameter('max_detections').value)
+
+        results = model.predict(
+            source=cv_image,
+            conf=min_confidence,
+            max_det=max_detections,
+            verbose=False,
+        )
+
+        objects = []
+        if not results:
+            return objects
+
+        result = results[0]
+        boxes = result.boxes
+        names = result.names if hasattr(result, 'names') else {}
+
+        if boxes is None or len(boxes) == 0:
+            return objects
+
+        for idx, box in enumerate(boxes, start=1):
+            cls_id = int(box.cls[0].item()) if box.cls is not None else -1
+            label = names.get(cls_id, str(cls_id))
+            conf = float(box.conf[0].item()) if box.conf is not None else 0.0
+
+            xyxy = box.xyxy[0].tolist()
+            x1, y1, x2, y2 = xyxy
+
+            u = float((x1 + x2) / 2.0)
+            v = float((y1 + y2) / 2.0)
+
+            objects.append(
+                {
+                    'id': idx,
+                    'type': label,
+                    'u': u,
+                    'v': v,
+                    'confidence': conf,
+                }
+            )
+
         return objects
 
 
@@ -149,3 +204,7 @@ def main(args=None) -> None:
 
         if rclpy.ok():
             rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
