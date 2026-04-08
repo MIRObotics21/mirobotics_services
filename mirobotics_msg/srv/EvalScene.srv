@@ -1,4 +1,5 @@
 string model_path
+string annotated_image_path
 ---
 bool success
 string error_msg

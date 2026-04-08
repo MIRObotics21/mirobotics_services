@@ -6,23 +6,22 @@ import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
-
-from sensor_msgs.msg import Image
-from cv_bridge import CvBridge, CvBridgeError
-
-from ultralytics import YOLO
-
 from mirobotics_msg.srv import EvalScene
+from sensor_msgs.msg import Image
 
+import cv2
+from cv_bridge import CvBridge, CvBridgeError
+from ultralytics import YOLO
 
 class SceneEvalServer(Node):
     def __init__(self) -> None:
         super().__init__('scene_eval_server')
 
-        self.declare_parameter('timeout_sec', 5.0)
         self.declare_parameter('default_model_path', '')
+        self.declare_parameter('timeout_sec', 5.0)
         self.declare_parameter('min_confidence', 0.25)
         self.declare_parameter('max_detections', 50)
+        self.declare_parameter('default_annotated_image_path', '')
 
         self._bridge = CvBridge()
         self._latest_image_msg: Optional[Image] = None
@@ -73,55 +72,7 @@ class SceneEvalServer(Node):
             self._loaded_model_path = model_path
         return self._model
 
-    def _handle_eval_scene(self, request: EvalScene.Request, response: EvalScene.Response):
-        timeout_sec = float(self.get_parameter('timeout_sec').value)
-        default_model_path = str(self.get_parameter('default_model_path').value)
-
-        model_path = request.model_path.strip() if request.model_path.strip() else default_model_path
-
-        if not model_path:
-            response.success = False
-            response.error_msg = (
-                'No model_path provided in request and default_model_path parameter is empty.'
-            )
-            response.json_objects = '[]'
-            return response
-
-        self.get_logger().info(f'Received scene evaluation request with model_path="{model_path}"')
-
-        image_msg = self._wait_for_one_image(timeout_sec)
-        if image_msg is None:
-            response.success = False
-            response.error_msg = (
-                f'Timeout waiting for one image on topic "image" after {timeout_sec:.2f} s.'
-            )
-            response.json_objects = '[]'
-            return response
-
-        try:
-            cv_image = self._bridge.imgmsg_to_cv2(image_msg, desired_encoding='bgr8')
-        except CvBridgeError as exc:
-            response.success = False
-            response.error_msg = f'Failed to convert ROS image to OpenCV image: {exc}'
-            response.json_objects = '[]'
-            return response
-
-        try:
-            objects = self._evaluate_scene(model_path, cv_image)
-        except Exception as exc:
-            response.success = False
-            response.error_msg = f'Scene evaluation failed: {exc}'
-            response.json_objects = '[]'
-            self.get_logger().error(response.error_msg)
-            return response
-
-        response.success = True
-        response.error_msg = ''
-        response.json_objects = json.dumps(objects)
-        self.get_logger().info(f'Scene evaluation succeeded. Returned {len(objects)} object(s).')
-        return response
-
-    def _evaluate_scene(self, model_path: str, cv_image):
+    def _evaluate_scene(self, model_path: str, cv_image, save_path: str):
         """
         Return a JSON-serializable Python list:
         [
@@ -178,8 +129,66 @@ class SceneEvalServer(Node):
                 }
             )
 
+        if str(save_path) != '':
+            annotated = result.plot()
+            ok = cv2.imwrite(str(save_path)+'anotated.png', annotated)
+
+            if not ok:
+                self.get_logger().info(f"[WARNING] Failed to save annotated image: {save_path}")
+            else:
+                self.get_logger().info(f"Saved annotated image: {save_path}")
+
         return objects
 
+    def _handle_eval_scene(self, request: EvalScene.Request, response: EvalScene.Response):
+        timeout_sec = float(self.get_parameter('timeout_sec').value)
+        default_model_path = str(self.get_parameter('default_model_path').value)
+        default_annotated_image_path = str(self.get_parameter('default_annotated_image_path').value)
+
+        model_path = request.model_path.strip() if request.model_path.strip() else default_model_path
+        annotated_image_path = request.annotated_image_path.strip() if request.annotated_image_path.strip() else default_annotated_image_path
+
+        if not model_path:
+            response.success = False
+            response.error_msg = (
+                'No model_path provided in request and default_model_path parameter is empty.'
+            )
+            response.json_objects = '[]'
+            return response
+
+        self.get_logger().info(f'Received scene evaluation request with model_path="{model_path}"')
+
+        image_msg = self._wait_for_one_image(timeout_sec)
+        if image_msg is None:
+            response.success = False
+            response.error_msg = (
+                f'Timeout waiting for one image on topic "/camera/camera/color/image_raw" after {timeout_sec:.2f} s.'
+            )
+            response.json_objects = '[]'
+            return response
+
+        try:
+            cv_image = self._bridge.imgmsg_to_cv2(image_msg, desired_encoding='bgr8')
+        except CvBridgeError as exc:
+            response.success = False
+            response.error_msg = f'Failed to convert ROS image to OpenCV image: {exc}'
+            response.json_objects = '[]'
+            return response
+
+        try:
+            objects = self._evaluate_scene(model_path, cv_image, annotated_image_path)
+        except Exception as exc:
+            response.success = False
+            response.error_msg = f'Scene evaluation failed: {exc}'
+            response.json_objects = '[]'
+            self.get_logger().error(response.error_msg)
+            return response
+
+        response.success = True
+        response.error_msg = ''
+        response.json_objects = json.dumps(objects)
+        self.get_logger().info(f'Scene evaluation succeeded. Found {len(objects)} object(s).')
+        return response
 
 def main(args=None) -> None:
     rclpy.init(args=args)
@@ -204,7 +213,6 @@ def main(args=None) -> None:
 
         if rclpy.ok():
             rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()
