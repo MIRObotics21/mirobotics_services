@@ -15,6 +15,7 @@ find_package(sensor_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/EvalScene.srv"
   "srv/PlanPath.srv"
+  "srv/CaptureScene.srv"
 )
 
 if(BUILD_TESTING)
