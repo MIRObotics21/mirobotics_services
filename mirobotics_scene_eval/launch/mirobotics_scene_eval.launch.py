@@ -1,8 +1,16 @@
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 def generate_launch_description():
+    image_publisher = LaunchConfiguration('image_publisher')
     return LaunchDescription([
+        DeclareLaunchArgument(
+            'image_publisher',
+            default_value='image',
+            description='Topic to use for scene evaluation image input'
+        ),
         Node(
             package='mirobotics_scene_eval',
             executable='scene_eval_server',
@@ -18,7 +26,7 @@ def generate_launch_description():
                 }
             ],
             remappings=[
-                ('image', '/camera/camera/color/image_raw'),
+                ('image', image_publisher),
             ],
         )
     ])
