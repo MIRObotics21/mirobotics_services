@@ -6,6 +6,8 @@ import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.qos import ReliabilityPolicy, HistoryPolicy, QoSProfile
+
 from mirobotics_msg.srv import EvalScene
 from sensor_msgs.msg import Image
 
@@ -29,46 +31,50 @@ class SceneEvalServer(Node):
         self.declare_parameter('default_annotated_image_path', '')
 
         self._bridge = CvBridge()
-        self._latest_image_msg: Optional[Image] = None
-        self._image_event = threading.Event()
 
-        self._model = None
+        self._latest_image_msg: Optional[Image] = None
+        self._image_lock = threading.Lock()
+        #self._image_event = threading.Event()
+
+        self._model: Optional[YOLO] = None
         self._loaded_model_path: Optional[str] = None
 
-        self._cb_group = ReentrantCallbackGroup()
+        #self._cb_group = ReentrantCallbackGroup()
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5,
+        )
 
         self._image_sub = self.create_subscription(
             Image,
             'image',
             self._image_callback,
-            10,
-            callback_group=self._cb_group,
+            #10,
+            #callback_group=self._cb_group,
+            qos,
         )
 
         self._service = self.create_service(
             EvalScene,
             '/mirobotics_scene_eval/mirobotics_eval_scene',
             self._handle_eval_scene,
-            callback_group=self._cb_group,
+            #callback_group=self._cb_group,
         )
 
+        resolved_topic = self.resolve_topic_name('image')
         self.get_logger().info(
-            'SceneEvalServer ready on /mirobotics_scene_eval/mirobotics_eval_scene'
+            f'SceneEvalServer ready on /mirobotics_scene_eval/mirobotics_eval_scene. '
+            f'Subscribing to: {resolved_topic}'
         )
 
     def _image_callback(self, msg: Image) -> None:
-        self._latest_image_msg = msg
-        self._image_event.set()
+        with self._image_lock:
+            self._latest_image_msg = msg
 
-    def _wait_for_one_image(self, timeout_sec: float) -> Optional[Image]:
-        self._latest_image_msg = None
-        self._image_event.clear()
-
-        got_image = self._image_event.wait(timeout=timeout_sec)
-        if not got_image:
-            return None
-
-        return self._latest_image_msg
+    def _get_latest_image(self) -> Optional[Image]:
+        with self._image_lock:
+            return self._latest_image_msg
 
     def _get_model(self, model_path: str) -> YOLO:
         if self._model is None or self._loaded_model_path != model_path:
@@ -163,12 +169,10 @@ class SceneEvalServer(Node):
 
         self.get_logger().info(f'Received scene evaluation request with model_path="{model_path}"')
 
-        image_msg = self._wait_for_one_image(timeout_sec)
+        image_msg = self._get_latest_image()
         if image_msg is None:
             response.success = False
-            response.error_msg = (
-                f'Timeout waiting for one image on topic "/camera/camera/color/image_raw" after {timeout_sec:.2f} s.'
-            )
+            response.error_msg = 'No image received yet on topic "image".'
             response.json_objects = '[]'
             return response
 
