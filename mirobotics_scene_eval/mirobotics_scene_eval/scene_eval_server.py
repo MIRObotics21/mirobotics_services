@@ -12,6 +12,11 @@ from sensor_msgs.msg import Image
 import cv2
 from cv_bridge import CvBridge, CvBridgeError
 from ultralytics import YOLO
+from ultralytics.utils import LOGGER
+import logging
+
+LOGGER.setLevel(logging.ERROR)
+LOGGER.disabled = True
 
 class SceneEvalServer(Node):
     def __init__(self) -> None:
@@ -67,7 +72,7 @@ class SceneEvalServer(Node):
 
     def _get_model(self, model_path: str) -> YOLO:
         if self._model is None or self._loaded_model_path != model_path:
-            self.get_logger().info(f'Loading YOLO model from: {model_path}')
+            self.get_logger().info(f'Loading model from: {model_path}')
             self._model = YOLO(model_path)
             self._loaded_model_path = model_path
         return self._model
@@ -85,7 +90,7 @@ class SceneEvalServer(Node):
             }
         ]
         """
-        model = self._get_model(model_path)
+        model = YOLO(self._get_model(model_path), task='detect')
 
         min_confidence = float(self.get_parameter('min_confidence').value)
         max_detections = int(self.get_parameter('max_detections').value)
