@@ -8,8 +8,8 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             'image_publisher',
-            default_value='image',
-            description='Topic to use for scene evaluation image input'
+            default_value='/camera/camera/color/image_raw',
+            description='Publisher from which sub to image topic'
         ),
         Node(
             package='mirobotics_scene_eval',
@@ -22,7 +22,7 @@ def generate_launch_description():
                     'default_model_path': '/home/mirobotics/models/best.pt',
                     'min_confidence': 0.5,
                     'max_detections': 10,
-                    'default_annotated_image_path': '/home/mirobotics/models/',
+                    'default_annotated_image_path': '',
                 }
             ],
             remappings=[
