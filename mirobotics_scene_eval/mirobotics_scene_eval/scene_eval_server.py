@@ -27,11 +27,11 @@ class SceneEvalServer(Node):
         self.declare_parameter('max_detections', 50)
         self.declare_parameter('default_annotated_image_path', '')
 
-        self._bridge = CvBridge()
 
         self._latest_image_msg: Optional[Image] = None
         self._image_lock = threading.Lock()
 
+        self._bridge = CvBridge()
         self._model: Optional[YOLO] = None
         self._loaded_model_path: Optional[str] = None
 
