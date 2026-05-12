@@ -9,7 +9,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'image_publisher',
             default_value='/camera/camera/color/image_raw',
-            description='Publisher from which sub to image topic'
+            description='Publisher from which sub to topic for image'
         ),
         Node(
             package='mirobotics_scene_eval',
@@ -18,7 +18,6 @@ def generate_launch_description():
             output='screen',
             parameters=[
                 {
-                    'timeout_sec': 5.0,
                     'default_model_path': '/home/mirobotics/models/best.pt',
                     'min_confidence': 0.5,
                     'max_detections': 10,

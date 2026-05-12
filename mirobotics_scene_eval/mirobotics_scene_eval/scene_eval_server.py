@@ -4,8 +4,6 @@ from typing import Optional
 
 import rclpy
 from rclpy.node import Node
-from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import ReliabilityPolicy, HistoryPolicy, QoSProfile
 
 from mirobotics_msg.srv import EvalScene
@@ -25,7 +23,6 @@ class SceneEvalServer(Node):
         super().__init__('scene_eval_server')
 
         self.declare_parameter('default_model_path', '')
-        self.declare_parameter('timeout_sec', 5.0)
         self.declare_parameter('min_confidence', 0.25)
         self.declare_parameter('max_detections', 50)
         self.declare_parameter('default_annotated_image_path', '')
@@ -34,12 +31,10 @@ class SceneEvalServer(Node):
 
         self._latest_image_msg: Optional[Image] = None
         self._image_lock = threading.Lock()
-        #self._image_event = threading.Event()
 
         self._model: Optional[YOLO] = None
         self._loaded_model_path: Optional[str] = None
 
-        #self._cb_group = ReentrantCallbackGroup()
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
@@ -50,8 +45,6 @@ class SceneEvalServer(Node):
             Image,
             'image',
             self._image_callback,
-            #10,
-            #callback_group=self._cb_group,
             qos,
         )
 
@@ -59,7 +52,6 @@ class SceneEvalServer(Node):
             EvalScene,
             '/mirobotics_scene_eval/mirobotics_eval_scene',
             self._handle_eval_scene,
-            #callback_group=self._cb_group,
         )
 
         resolved_topic = self.resolve_topic_name('image')
@@ -152,7 +144,6 @@ class SceneEvalServer(Node):
         return objects
 
     def _handle_eval_scene(self, request: EvalScene.Request, response: EvalScene.Response):
-        timeout_sec = float(self.get_parameter('timeout_sec').value)
         default_model_path = str(self.get_parameter('default_model_path').value)
         default_annotated_image_path = str(self.get_parameter('default_annotated_image_path').value)
 
@@ -202,26 +193,17 @@ class SceneEvalServer(Node):
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = SceneEvalServer()
-    executor = MultiThreadedExecutor()
-    executor.add_node(node)
 
     try:
-        executor.spin()
+        rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
         try:
-            executor.shutdown()
-        except Exception:
-            pass
-
-        try:
             node.destroy_node()
         except Exception:
             pass
-
-        if rclpy.ok():
-            rclpy.shutdown()
+        rclpy.try_shutdown()
 
 if __name__ == '__main__':
     main()
