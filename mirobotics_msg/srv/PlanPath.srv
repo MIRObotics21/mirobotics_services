@@ -1,6 +1,5 @@
-float64[3] start
-float64[3] goal
-string json_point_cloud
+int64 start_id
+int64 goal_id
 ---
 bool success
 string error_msg
