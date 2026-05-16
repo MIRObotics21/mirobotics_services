@@ -16,6 +16,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/EvalScene.srv"
   "srv/PlanPath.srv"
   "srv/CaptureScene.srv"
+  "action/GenerateScene.action"
+  "action/PlanAndExecute.action"
 )
 
 if(BUILD_TESTING)

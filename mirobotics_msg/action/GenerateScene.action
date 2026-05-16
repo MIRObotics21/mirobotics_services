@@ -1,0 +1,10 @@
+string model_path
+float32 voxel_size
+---
+bool success
+string error_msg
+string json_matrix
+string json_objects_3d
+---
+string current_step
+float32 progress

@@ -13,11 +13,13 @@ def generate_launch_description():
             description='Publisher from which sub to pointcloud2 topic'
         ),
         Node(
-            package='mirobotics_path_planner',  # change if different
-            executable='path_planner_server',   # matches your filename without .py
+            package='mirobotics_path_planner',
+            executable='path_planner_server',
             name='path_planner_server',
             output='screen',
-            parameters=[],
+            parameters=[{
+                'planning_frame': 'base_link',
+            }],
             remappings=[
                 ('pointcloud2', pointcloud2_publisher),
             ],

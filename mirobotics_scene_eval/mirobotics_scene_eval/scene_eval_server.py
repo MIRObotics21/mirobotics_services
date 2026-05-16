@@ -56,8 +56,7 @@ class SceneEvalServer(Node):
 
         resolved_topic = self.resolve_topic_name('image')
         self.get_logger().info(
-            f'SceneEvalServer ready on /mirobotics_scene_eval/mirobotics_eval_scene. '
-            f'Subscribing to: {resolved_topic}'
+            f'SceneEval server started. Subscribing to: {resolved_topic}'
         )
 
     def _image_callback(self, msg: Image) -> None:

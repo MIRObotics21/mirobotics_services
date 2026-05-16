@@ -8,7 +8,10 @@ from rclpy.node import Node
 from rclpy.qos import ReliabilityPolicy, HistoryPolicy, QoSProfile
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
+import tf2_ros
+from geometry_msgs.msg import TransformStamped
 
+import math
 import numpy as np
 
 from mirobotics_msg.srv import CaptureScene, PlanPath
@@ -43,6 +46,10 @@ class CaptureSceneServer(Node):
         self._cloud_buffer: Deque[PointCloud2] = deque(maxlen=self._buffer_size)
         self._buffer_lock = threading.Lock()
 
+        self.declare_parameter('planning_frame', '')
+        self._tf_buffer = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+
         self._latest_scene_json = None
         self._latest_scene_matrix = None
         self._latest_voxel_size = None
@@ -76,7 +83,7 @@ class CaptureSceneServer(Node):
         )
 
         self.get_logger().info(
-            f"CaptureScene server started. Subscribing to: {resolved_topic}"
+            f"PathPlanner server started. Subscribing to: {resolved_topic}"
         )
 
     def _pointcloud_callback(self, msg: PointCloud2) -> None:
@@ -205,7 +212,68 @@ class CaptureSceneServer(Node):
 
         return full_cube_matrix.astype(np.float32, copy=False)
 
+    def _transform_xyz_matrix(
+            self,
+            xyz_matrix: np.ndarray,
+            source_frame: str,
+            target_frame: str,
+    ) -> np.ndarray:
+        """
+        Transform an N x 3 XYZ matrix from source_frame into target_frame.
+        """
+        if xyz_matrix.size == 0:
+            return xyz_matrix
+
+        if source_frame == target_frame:
+            return xyz_matrix
+
+        transform = self._tf_buffer.lookup_transform(
+            target_frame,
+            source_frame,
+            rclpy.time.Time(),
+            timeout=rclpy.duration.Duration(seconds=1.0),
+        )
+
+        translation = transform.transform.translation
+        rotation = transform.transform.rotation
+
+        tx = translation.x
+        ty = translation.y
+        tz = translation.z
+
+        qx = rotation.x
+        qy = rotation.y
+        qz = rotation.z
+        qw = rotation.w
+
+        # Quaternion to rotation matrix
+        r00 = 1.0 - 2.0 * (qy * qy + qz * qz)
+        r01 = 2.0 * (qx * qy - qz * qw)
+        r02 = 2.0 * (qx * qz + qy * qw)
+
+        r10 = 2.0 * (qx * qy + qz * qw)
+        r11 = 1.0 - 2.0 * (qx * qx + qz * qz)
+        r12 = 2.0 * (qy * qz - qx * qw)
+
+        r20 = 2.0 * (qx * qz - qy * qw)
+        r21 = 2.0 * (qy * qz + qx * qw)
+        r22 = 1.0 - 2.0 * (qx * qx + qy * qy)
+
+        rotation_matrix = np.array([
+            [r00, r01, r02],
+            [r10, r11, r12],
+            [r20, r21, r22],
+        ], dtype=np.float64)
+
+        translation_vector = np.array([tx, ty, tz], dtype=np.float64)
+
+        transformed = xyz_matrix.astype(np.float64) @ rotation_matrix.T
+        transformed += translation_vector
+
+        return transformed.astype(np.float32)
+
     def _handle_capture_scene(self, request: CaptureScene.Request, response: CaptureScene.Response) -> CaptureScene.Response:
+        self.get_logger().info(f"Recieved request for voxelization with size: {float(request.voxel_size)}.")
         if request.voxel_size <= 0.0:
             response.success = False
             response.error_msg = 'voxel_size must be greater than 0.'
@@ -233,7 +301,27 @@ class CaptureSceneServer(Node):
                 response.json_matrix = ''
                 return response
 
-            self.get_logger().info(f"Merged {len(buffered_clouds)} clouds into matrix with shape {merged_matrix.shape}")
+            source_frame = buffered_clouds[-1].header.frame_id
+            target_frame = self.get_parameter('planning_frame').value
+
+            if not target_frame:
+                target_frame = source_frame
+
+            try:
+                if target_frame != source_frame:
+                    merged_matrix = self._transform_xyz_matrix(
+                        merged_matrix,
+                        source_frame,
+                        target_frame,
+                    )
+            except Exception as exc:
+                response.success = False
+                response.error_msg = (
+                    f'Failed to transform point cloud from {source_frame} '
+                    f'to {target_frame}: {str(exc)}'
+                )
+                response.json_matrix = ''
+                return response
 
             occupied_cube_matrix = self._voxelize_occupied_points(
                 merged_matrix,
@@ -254,6 +342,8 @@ class CaptureSceneServer(Node):
             cube_ids = np.arange(cube_matrix.shape[0], dtype=np.float64).reshape(-1, 1)
             cube_matrix = np.hstack((cube_ids, cube_matrix.astype(np.float64)))
             cube_matrix = np.round(cube_matrix.astype(np.float64), decimals=4)
+
+            self.get_logger().info(f"Voxelization succesful.")
 
             payload = {
                 'voxel_size': round(float(request.voxel_size), 4),

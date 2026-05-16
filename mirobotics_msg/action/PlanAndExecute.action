@@ -1,0 +1,8 @@
+int64 start_voxel_id
+int64 goal_voxel_id
+---
+bool success
+string error_msg
+---
+string current_step
+float32 progress
