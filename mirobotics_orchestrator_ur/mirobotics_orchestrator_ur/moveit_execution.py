@@ -36,9 +36,10 @@ def voxel_path_to_poses(
         if len(row) < 4:
             continue
 
+        TCP_Z_OFFSET = 0.1866
         x = float(row[1])
         y = float(row[2])
-        z = float(row[3])
+        z = float(row[3]) - TCP_Z_OFFSET
 
         if last_position is not None:
             dx = x - last_position[0]
@@ -63,3 +64,35 @@ def voxel_path_to_poses(
         last_position = (x, y, z)
 
     return poses
+
+def json_path_to_goal_pose(
+    json_path: str,
+    fixed_orientation=None,
+    tcp_z_offset: float = 0.1866,
+):
+    rows = parse_json_path(json_path)
+
+    if not rows:
+        raise ValueError("json_path contains no path rows")
+
+    row = rows[-1]
+
+    if fixed_orientation is None:
+        fixed_orientation = {
+            "x": 1.0,
+            "y": 0.0,
+            "z": 0.0,
+            "w": 0.0,
+        }
+
+    pose = Pose()
+    pose.position.x = float(row[1])
+    pose.position.y = float(row[2])
+    pose.position.z = float(row[3]) - tcp_z_offset
+
+    pose.orientation.x = fixed_orientation["x"]
+    pose.orientation.y = fixed_orientation["y"]
+    pose.orientation.z = fixed_orientation["z"]
+    pose.orientation.w = fixed_orientation["w"]
+
+    return pose
