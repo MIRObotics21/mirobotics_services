@@ -36,10 +36,9 @@ def voxel_path_to_poses(
         if len(row) < 4:
             continue
 
-        TCP_Z_OFFSET = 0.1866
         x = float(row[1])
         y = float(row[2])
-        z = float(row[3]) - TCP_Z_OFFSET
+        z = float(row[3]) - 0.1866
 
         if last_position is not None:
             dx = x - last_position[0]

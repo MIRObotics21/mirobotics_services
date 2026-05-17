@@ -1,12 +1,20 @@
 import math
+import json
 
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionServer, ActionClient
 from rclpy.duration import Duration
 
-from moveit_msgs.srv import GetCartesianPath
-from moveit_msgs.action import ExecuteTrajectory
+from geometry_msgs.msg import PointStamped,Pose
+from moveit_msgs.action import MoveGroup
+from moveit_msgs.msg import (
+    Constraints,
+    PositionConstraint,
+    MotionPlanRequest,
+    PlanningOptions,
+)
+from shape_msgs.msg import SolidPrimitive
 
 from sensor_msgs.msg import CameraInfo
 from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
@@ -15,29 +23,20 @@ from mirobotics_msg.action import GenerateScene, PlanAndExecute
 from mirobotics_msg.srv import EvalScene, CaptureScene, PlanPath
 
 from mirobotics_orchestrator_ur.ray_casting import assign_objects_to_voxels
-from mirobotics_orchestrator_ur.moveit_execution import voxel_path_to_poses
-
-COMPUTE_CARTESIAN_PATH_SERVICE = '/compute_cartesian_path'
-EXECUTE_TRAJECTORY_ACTION = '/execute_trajectory'
-
-MOVE_GROUP_NAME = 'ur_manipulator'
-MOVEIT_BASE_FRAME = 'base_link'
-MOVEIT_TIP_LINK = 'tool0'   # change later to 'rg2_tcp'
-CARTESIAN_MAX_STEP = 0.01
-CARTESIAN_JUMP_THRESHOLD = 0.0
-MIN_WAYPOINT_DISTANCE = 0.03
-TCP_Z_OFFSET = 0.1866
 
 BASE_FRAME = 'base_link'
-
 SCENE_EVAL_SERVICE = '/mirobotics_scene_eval/mirobotics_eval_scene'
 CAPTURE_SCENE_SERVICE = '/capture_scene'
 PLAN_PATH_SERVICE = '/plan_path'
-
 RAY_STEP = 0.02
 RAY_MAX_DISTANCE = 3.0
 OCCUPIED_PASSABLE_VALUE = 0.0
 
+MOVE_GROUP_ACTION = '/move_action'
+MOVE_GROUP_NAME = 'ur_manipulator'
+MOVEIT_TARGET_LINK = 'tool0'
+TOOL0_TCP_OFFSET_Z = -0.1866
+POSITION_TOLERANCE = 0.03
 
 class OrchestratorURServer(Node):
 
@@ -61,6 +60,9 @@ class OrchestratorURServer(Node):
         self.image_width = None
         self.image_height = None
         self.camera_frame = None
+
+        self.latest_json_matrix = ''
+        self.latest_voxel_size = None
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -87,22 +89,6 @@ class OrchestratorURServer(Node):
             PLAN_PATH_SERVICE
         )
 
-        self.cartesian_path_client = self.create_client(
-            GetCartesianPath,
-            COMPUTE_CARTESIAN_PATH_SERVICE
-        )
-
-        self.execute_trajectory_client = ActionClient(
-            self,
-            ExecuteTrajectory,
-            EXECUTE_TRAJECTORY_ACTION
-        )
-
-        self.latest_json_matrix = ''
-        self.latest_json_objects_3d = '[]'
-        self.latest_voxel_size = None
-        self.scene_ready = False
-
         self.action_server = ActionServer(
             self,
             GenerateScene,
@@ -117,17 +103,18 @@ class OrchestratorURServer(Node):
             self.execute_plan_and_execute_callback
         )
 
+        self.move_group_client = ActionClient(
+            self,
+            MoveGroup,
+            MOVE_GROUP_ACTION
+        )
+
         self.get_logger().info(
             f'Using camera info topic: {self.camera_info_topic}'
         )
+
         self.get_logger().info(
-            f'Using EvalScene service: {SCENE_EVAL_SERVICE}'
-        )
-        self.get_logger().info(
-            f'Using CaptureScene service: {CAPTURE_SCENE_SERVICE}'
-        )
-        self.get_logger().info(
-            'mirobotics_orchestrator_ur action server started: /generate_scene'
+            'mirobotics_orchestrator_ur action server started.'
         )
 
     def camera_info_callback(self, msg: CameraInfo):
@@ -143,17 +130,6 @@ class OrchestratorURServer(Node):
         self.image_width = msg.width
         self.image_height = msg.height
         self.camera_frame = msg.header.frame_id
-
-        self.get_logger().info(
-            f'Camera intrinsics received: '
-            f'fx={self.fx}, fy={self.fy}, cx={self.cx}, cy={self.cy}'
-        )
-        self.get_logger().info(
-            f'Image size: {self.image_width}x{self.image_height}'
-        )
-        self.get_logger().info(
-            f'Camera frame: {self.camera_frame}'
-        )
 
     def publish_feedback(self, goal_handle, current_step, progress):
         feedback = GenerateScene.Feedback()
@@ -373,163 +349,214 @@ class OrchestratorURServer(Node):
         result.json_matrix = updated_json_matrix
         result.json_objects_3d = json_objects_3d
 
-        self.latest_json_matrix = capture_response.json_matrix
-        self.latest_json_objects_3d = json_objects_3d
+        self.latest_json_matrix = updated_json_matrix
         self.latest_voxel_size = goal.voxel_size
-        self.scene_ready = True
+
         self.publish_feedback(goal_handle, 'done', 1.0)
 
         goal_handle.succeed()
         return result
 
+    def publish_plan_feedback(self, goal_handle, current_step, progress):
+        feedback = PlanAndExecute.Feedback()
+        feedback.current_step = current_step
+        feedback.progress = float(progress)
+        goal_handle.publish_feedback(feedback)
+
+        self.get_logger().info(
+            f'PlanAndExecute feedback: {current_step} ({progress:.2f})'
+        )
+
+    def find_voxel_by_id(self, voxel_id):
+        if not self.latest_json_matrix:
+            raise RuntimeError('No voxel matrix available. Run generate_scene first.')
+
+        data = json.loads(self.latest_json_matrix)
+
+        if not isinstance(data, dict):
+            raise RuntimeError('latest_json_matrix must be a JSON object with key "matrix"')
+
+        if 'matrix' not in data:
+            raise RuntimeError('latest_json_matrix does not contain key "matrix"')
+
+        matrix = data['matrix']
+        target_id = int(voxel_id)
+
+        if target_id < 0 or target_id >= len(matrix):
+            raise RuntimeError(
+                f'Voxel id {target_id} is outside matrix row range 0 -> {len(matrix) - 1}'
+            )
+
+        voxel = matrix[target_id]
+
+        if not isinstance(voxel, list) or len(voxel) < 5:
+            raise RuntimeError(f'Invalid voxel row at index {target_id}: {voxel}')
+
+        row_id = int(float(voxel[0]))
+
+        if row_id != target_id:
+            self.get_logger().warn(
+                f'Voxel row index {target_id} has row id {row_id}. '
+                f'Using row index as requested.'
+            )
+
+        return {
+            'id': row_id,
+            'x': float(voxel[1]),
+            'y': float(voxel[2]),
+            'z': float(voxel[3]),
+            'passable': float(voxel[4]),
+        }
+
+    def create_tool0_position_constraint(self, x, y, z):
+        constraint = PositionConstraint()
+        constraint.header.frame_id = BASE_FRAME
+        constraint.link_name = MOVEIT_TARGET_LINK
+        constraint.weight = 1.0
+
+        primitive = SolidPrimitive()
+        primitive.type = SolidPrimitive.BOX
+        primitive.dimensions = [
+            POSITION_TOLERANCE,
+            POSITION_TOLERANCE,
+            POSITION_TOLERANCE,
+        ]
+
+        pose = Pose()
+        pose.position.x = float(x)
+        pose.position.y = float(y)
+        pose.position.z = float(z)
+        pose.orientation.w = 1.0
+
+        constraint.constraint_region.primitives.append(primitive)
+        constraint.constraint_region.primitive_poses.append(pose)
+
+        return constraint
+
+    def create_move_group_goal(self, tool0_x, tool0_y, tool0_z):
+        constraints = Constraints()
+        constraints.name = 'tool0_position_only_goal'
+        constraints.position_constraints.append(
+            self.create_tool0_position_constraint(
+                tool0_x,
+                tool0_y,
+                tool0_z
+            )
+        )
+
+        request = MotionPlanRequest()
+        request.group_name = MOVE_GROUP_NAME
+        request.num_planning_attempts = 10
+        request.allowed_planning_time = 8.0
+        request.max_velocity_scaling_factor = 0.2
+        request.max_acceleration_scaling_factor = 0.2
+        request.goal_constraints.append(constraints)
+
+        planning_options = PlanningOptions()
+        planning_options.plan_only = False
+        planning_options.look_around = False
+        planning_options.replan = True
+        planning_options.replan_attempts = 3
+
+        goal_msg = MoveGroup.Goal()
+        goal_msg.request = request
+        goal_msg.planning_options = planning_options
+
+        return goal_msg
+
     async def execute_plan_and_execute_callback(self, goal_handle):
         self.get_logger().info('PlanAndExecute action goal received')
 
-        goal = goal_handle.request
         result = PlanAndExecute.Result()
+        goal = goal_handle.request
 
-        self.get_logger().info(
-            f'Goal start_voxel_id={goal.start_voxel_id}, '
-            f'goal_voxel_id={goal.goal_voxel_id}'
-        )
+        try:
+            self.publish_plan_feedback(goal_handle, 'checking_voxel_matrix', 0.05)
 
-        feedback = PlanAndExecute.Feedback()
-        feedback.current_step = 'checking_plan_path_service'
-        feedback.progress = 0.1
-        goal_handle.publish_feedback(feedback)
+            start_voxel = self.find_voxel_by_id(goal.start_voxel_id)
+            goal_voxel = self.find_voxel_by_id(goal.goal_voxel_id)
 
-        if not self.plan_path_client.wait_for_service(timeout_sec=5.0):
-            result.success = False
-            result.error_msg = f'PlanPath service not available: {PLAN_PATH_SERVICE}'
-            goal_handle.abort()
-            return result
+            if start_voxel['passable'] <= 0.0:
+                result.success = False
+                result.error_msg = f'Start voxel {goal.start_voxel_id} is not passable'
+                goal_handle.abort()
+                return result
 
-        feedback.current_step = 'calling_plan_path'
-        feedback.progress = 0.4
-        goal_handle.publish_feedback(feedback)
+            if goal_voxel['passable'] <= 0.0:
+                result.success = False
+                result.error_msg = f'Goal voxel {goal.goal_voxel_id} is not passable'
+                goal_handle.abort()
+                return result
 
-        request = PlanPath.Request()
-        request.start_id = goal.start_voxel_id
-        request.goal_id = goal.goal_voxel_id
+            self.publish_plan_feedback(goal_handle, 'creating_tool0_goal', 0.20)
 
-        future = self.plan_path_client.call_async(request)
-        response = await future
+            tool0_x = goal_voxel['x']
+            tool0_y = goal_voxel['y']
+            tool0_z = goal_voxel['z'] - TOOL0_TCP_OFFSET_Z
 
-        if not response.success:
-            result.success = False
-            result.error_msg = f'PlanPath failed: {response.error_msg}'
-            goal_handle.abort()
-            return result
-
-        self.get_logger().info(
-            f'PlanPath returned json_path: {response.json_path}'
-        )
-
-        feedback.current_step = 'converting_path_to_waypoints'
-        feedback.progress = 0.55
-        goal_handle.publish_feedback(feedback)
-
-        waypoints = voxel_path_to_poses(
-            response.json_path,
-            min_distance=MIN_WAYPOINT_DISTANCE,
-        )
-
-        if len(waypoints) < 2:
-            result.success = False
-            result.error_msg = f'Not enough waypoints for execution: {len(waypoints)}'
-            goal_handle.abort()
-            return result
-
-        self.get_logger().info(
-            f'Converted PlanPath result to {len(waypoints)} MoveIt waypoints'
-        )
-
-        feedback.current_step = 'waiting_for_moveit_cartesian_service'
-        feedback.progress = 0.60
-        goal_handle.publish_feedback(feedback)
-
-        if not self.cartesian_path_client.wait_for_service(timeout_sec=5.0):
-            result.success = False
-            result.error_msg = 'MoveIt /compute_cartesian_path service not available'
-            goal_handle.abort()
-            return result
-
-        feedback.current_step = 'computing_cartesian_path'
-        feedback.progress = 0.70
-        goal_handle.publish_feedback(feedback)
-
-        cartesian_request = GetCartesianPath.Request()
-        cartesian_request.header.frame_id = MOVEIT_BASE_FRAME
-        cartesian_request.group_name = MOVE_GROUP_NAME
-        cartesian_request.link_name = MOVEIT_TIP_LINK
-        cartesian_request.waypoints = waypoints
-        cartesian_request.max_step = CARTESIAN_MAX_STEP
-        cartesian_request.jump_threshold = CARTESIAN_JUMP_THRESHOLD
-        cartesian_request.avoid_collisions = True
-
-        cartesian_future = self.cartesian_path_client.call_async(cartesian_request)
-        cartesian_response = await cartesian_future
-
-        self.get_logger().info(
-            f'MoveIt Cartesian path fraction: {cartesian_response.fraction}'
-        )
-
-        if cartesian_response.fraction < 0.95:
-            result.success = False
-            result.error_msg = (
-                f'MoveIt Cartesian path incomplete. '
-                f'Fraction={cartesian_response.fraction:.3f}'
+            self.get_logger().info(
+                f'Goal voxel center: '
+                f'x={goal_voxel["x"]:.3f}, '
+                f'y={goal_voxel["y"]:.3f}, '
+                f'z={goal_voxel["z"]:.3f}'
             )
-            goal_handle.abort()
-            return result
 
-        feedback.current_step = 'waiting_for_execute_trajectory_action'
-        feedback.progress = 0.80
-        goal_handle.publish_feedback(feedback)
-
-        if not self.execute_trajectory_client.wait_for_server(timeout_sec=5.0):
-            result.success = False
-            result.error_msg = 'MoveIt /execute_trajectory action not available'
-            goal_handle.abort()
-            return result
-
-        feedback.current_step = 'executing_trajectory'
-        feedback.progress = 0.90
-        goal_handle.publish_feedback(feedback)
-
-        execute_goal = ExecuteTrajectory.Goal()
-        execute_goal.trajectory = cartesian_response.solution
-
-        send_goal_future = self.execute_trajectory_client.send_goal_async(execute_goal)
-        execute_goal_handle = await send_goal_future
-
-        if not execute_goal_handle.accepted:
-            result.success = False
-            result.error_msg = 'MoveIt ExecuteTrajectory goal was rejected'
-            goal_handle.abort()
-            return result
-
-        execute_result_future = execute_goal_handle.get_result_async()
-        execute_result = await execute_result_future
-
-        if execute_result.result.error_code.val != 1:
-            result.success = False
-            result.error_msg = (
-                f'MoveIt execution failed with error code: '
-                f'{execute_result.result.error_code.val}'
+            self.get_logger().info(
+                f'Tool0 target with TCP offset: '
+                f'x={tool0_x:.3f}, y={tool0_y:.3f}, z={tool0_z:.3f}'
             )
-            goal_handle.abort()
+
+            self.publish_plan_feedback(goal_handle, 'waiting_for_move_group', 0.30)
+
+            if not self.move_group_client.wait_for_server(timeout_sec=10.0):
+                result.success = False
+                result.error_msg = f'MoveGroup action server not available: {MOVE_GROUP_ACTION}'
+                goal_handle.abort()
+                return result
+
+            move_goal = self.create_move_group_goal(
+                tool0_x,
+                tool0_y,
+                tool0_z
+            )
+
+            self.publish_plan_feedback(goal_handle, 'sending_goal_to_moveit', 0.45)
+
+            send_goal_future = self.move_group_client.send_goal_async(move_goal)
+            move_goal_handle = await send_goal_future
+
+            if not move_goal_handle.accepted:
+                result.success = False
+                result.error_msg = 'MoveGroup goal was rejected'
+                goal_handle.abort()
+                return result
+
+            self.publish_plan_feedback(goal_handle, 'planning_and_executing', 0.65)
+
+            move_result_future = move_goal_handle.get_result_async()
+            move_result_response = await move_result_future
+
+            move_result = move_result_response.result
+            error_code = move_result.error_code.val
+
+            if error_code != 1:
+                result.success = False
+                result.error_msg = f'MoveGroup failed with error code: {error_code}'
+                goal_handle.abort()
+                return result
+
+            self.publish_plan_feedback(goal_handle, 'done', 1.0)
+
+            result.success = True
+            result.error_msg = ''
+            goal_handle.succeed()
             return result
 
-        feedback.current_step = 'done'
-        feedback.progress = 1.0
-        goal_handle.publish_feedback(feedback)
-
-        result.success = True
-        result.error_msg = ''
-
-        goal_handle.succeed()
-        return result
+        except Exception as exc:
+            result.success = False
+            result.error_msg = f'PlanAndExecute failed: {str(exc)}'
+            goal_handle.abort()
+            return result
 
 def main(args=None) -> None:
     rclpy.init(args=args)
