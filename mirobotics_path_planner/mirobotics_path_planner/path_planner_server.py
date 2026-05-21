@@ -19,25 +19,6 @@ from mirobotics_path_planner.astar_3d import AStar3D
 
 
 class CaptureSceneServer(Node):
-    """
-    First-stage CaptureScene server.
-
-    Current behavior:
-    - Continuously subscribes to /camera/camera/depth/color/points
-    - Keeps the latest 3 PointCloud2 messages
-    - On CaptureScene request with begin=True:
-        - Converts buffered clouds to NumPy XYZ matrices
-        - Merges them into one N x 3 matrix
-        - Serializes the matrix into JSON
-        - Returns it in json_matrix
-
-    Intended future extension:
-    - Add workspace cropping
-    - Add voxelization into cubes
-    - Add passable/impassable labeling
-    - Reuse processed scene for PlanPath service
-    """
-
     def __init__(self) -> None:
         super().__init__('path_planner_server')
 
