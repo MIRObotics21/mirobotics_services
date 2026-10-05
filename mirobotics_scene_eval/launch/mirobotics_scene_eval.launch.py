@@ -22,6 +22,7 @@ def generate_launch_description():
                     'min_confidence': 0.5,
                     'max_detections': 10,
                     'default_annotated_image_path': '',
+                    'max_image_age': 1.0,
                 }
             ],
             remappings=[

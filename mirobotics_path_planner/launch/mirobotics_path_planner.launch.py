@@ -19,6 +19,14 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'planning_frame': 'base_link',
+                # Workspace box [x, y, z] in planning_frame, in meters.
+                # Example values, adjust to the real workcell. Set z of
+                # workspace_min just below the table top to keep the table
+                # as the bottom obstacle layer.
+                'workspace_min': [-0.5, -0.5, -0.05],
+                'workspace_max': [0.5, 0.5, 0.6],
+                'min_points_per_voxel': 3,
+                'fill_below_occupied': True,
             }],
             remappings=[
                 ('pointcloud2', pointcloud2_publisher),

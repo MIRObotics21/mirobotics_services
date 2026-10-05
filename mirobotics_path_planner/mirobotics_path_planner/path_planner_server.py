@@ -1,7 +1,8 @@
 import json
 import threading
+import time
 from collections import deque
-from typing import Deque, List, Optional
+from typing import Deque
 
 import rclpy
 from rclpy.node import Node
@@ -9,13 +10,20 @@ from rclpy.qos import ReliabilityPolicy, HistoryPolicy, QoSProfile
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
 import tf2_ros
-from geometry_msgs.msg import TransformStamped
 
-import math
 import numpy as np
 
 from mirobotics_msg.srv import CaptureScene, PlanPath
 from mirobotics_path_planner.astar_3d import AStar3D
+from mirobotics_path_planner.voxel_grid import (
+    compute_grid,
+    crop_to_workspace,
+    fill_below_occupied,
+    occupancy_to_matrix,
+    quaternion_to_rotation_matrix,
+    transform_points,
+    voxelize,
+)
 
 
 class CaptureSceneServer(Node):
@@ -28,6 +36,16 @@ class CaptureSceneServer(Node):
         self._buffer_lock = threading.Lock()
 
         self.declare_parameter('planning_frame', '')
+        # Workspace box [x, y, z] in planning_frame, in meters.
+        # Points outside are discarded and the voxel grid covers exactly this box.
+        self.declare_parameter('workspace_min', [-0.5, -0.5, 0.0])
+        self.declare_parameter('workspace_max', [0.5, 0.5, 0.6])
+        # Voxel is occupied only if it contains at least this many points.
+        self.declare_parameter('min_points_per_voxel', 3)
+        # Mark everything under the highest occupied voxel of a column as occupied.
+        self.declare_parameter('fill_below_occupied', True)
+        self.declare_parameter('max_voxels', 2000000)
+
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
 
@@ -51,13 +69,13 @@ class CaptureSceneServer(Node):
             qos,
         )
 
-        self._service = self.create_service(
+        self._capture_scene_service = self.create_service(
             CaptureScene,
             'capture_scene',
             self._handle_capture_scene,
         )
 
-        self._service = self.create_service(
+        self._plan_path_service = self.create_service(
             PlanPath,
             'plan_path',
             self._handle_plan_path,
@@ -78,31 +96,29 @@ class CaptureSceneServer(Node):
     def _pointcloud2_to_xyz_numpy(self, msg: PointCloud2) -> np.ndarray:
         """
         Convert PointCloud2 to an N x 3 NumPy array [x, y, z].
-        NaN points are skipped.
+        NaN and infinite points are skipped.
         Only x, y, z fields are extracted.
         """
-        points_iter = point_cloud2.read_points(
+        points = point_cloud2.read_points(
             msg,
             field_names=('x', 'y', 'z'),
             skip_nans=True,
         )
 
-        points_list = list(points_iter)
-        if not points_list:
-            return np.empty((0, 3), dtype=np.float32)
+        if not isinstance(points, np.ndarray):
+            # Older sensor_msgs_py returns a generator of tuples
+            points = np.array(list(points), dtype=np.float32).reshape(-1, 3)
+        elif points.dtype.names is not None:
+            # Structured array case: fields are named x, y, z
+            points = np.column_stack((
+                points['x'],
+                points['y'],
+                points['z'],
+            ))
 
-        points_array = np.asarray(points_list)
+        points = points.astype(np.float32, copy=False).reshape(-1, 3)
 
-        # Structured array case: fields are named x, y, z
-        if points_array.dtype.names is not None:
-            return np.column_stack((
-                points_array['x'],
-                points_array['y'],
-                points_array['z'],
-            )).astype(np.float32, copy=False)
-
-        # Plain tuple/list case
-        return points_array.astype(np.float32, copy=False).reshape(-1, 3)
+        return points[np.all(np.isfinite(points), axis=1)]
 
     def _merge_buffered_clouds(self, clouds: list[PointCloud2]) -> np.ndarray:
         matrices = []
@@ -116,82 +132,7 @@ class CaptureSceneServer(Node):
         if not matrices:
             return np.empty((0, 3), dtype=np.float32)
 
-        return np.vstack(matrices).astype(np.float32, copy=False)
-
-    def _voxelize_occupied_points(self, xyz_matrix: np.ndarray, voxel_size: float) -> np.ndarray:
-        """
-        Convert XYZ points into occupied voxel centers.
-
-        Output matrix:
-        N x 4 = [x_center, y_center, z_center, passable]
-
-        passable:
-        0.0 = impassable / occupied
-        """
-
-        if voxel_size <= 0.0:
-            raise ValueError('voxel_size must be greater than 0.')
-
-        if xyz_matrix.size == 0:
-            return np.empty((0, 4), dtype=np.float32)
-
-        voxel_indices = np.floor(xyz_matrix / voxel_size).astype(np.int32)
-
-        unique_indices = np.unique(voxel_indices, axis=0)
-
-        voxel_centers = (unique_indices.astype(np.float32) + 0.5) * voxel_size
-
-        passable_column = np.zeros((voxel_centers.shape[0], 1), dtype=np.float32)
-
-        cube_matrix = np.hstack((voxel_centers, passable_column))
-
-        return cube_matrix.astype(np.float32, copy=False)
-
-    def _create_full_cuboid_voxel_matrix(
-            self,
-            occupied_cube_matrix: np.ndarray,
-            voxel_size: float,
-    ) -> np.ndarray:
-        if occupied_cube_matrix.size == 0:
-            return np.empty((0, 4), dtype=np.float32)
-
-        occupied_centers = occupied_cube_matrix[:, :3]
-
-        occupied_indices = np.round(
-            occupied_centers / voxel_size - 0.5
-        ).astype(np.int32)
-
-        min_idx = np.min(occupied_indices, axis=0)
-        max_idx = np.max(occupied_indices, axis=0)
-
-        x_idx = np.arange(min_idx[0], max_idx[0] + 1)
-        y_idx = np.arange(min_idx[1], max_idx[1] + 1)
-        z_idx = np.arange(min_idx[2], max_idx[2] + 1)
-
-        ii, jj, kk = np.meshgrid(x_idx, y_idx, z_idx, indexing='ij')
-
-        all_indices = np.column_stack((
-            ii.ravel(),
-            jj.ravel(),
-            kk.ravel(),
-        )).astype(np.int32)
-
-        occupied_set = set(map(tuple, occupied_indices))
-
-        passable = np.ones((all_indices.shape[0], 1), dtype=np.float32)
-
-        for row_idx, voxel_idx in enumerate(map(tuple, all_indices)):
-            if voxel_idx in occupied_set:
-                passable[row_idx, 0] = 0.0
-
-        centers = (all_indices.astype(np.float32) + 0.5) * voxel_size
-
-        full_cube_matrix = np.hstack((
-            centers,
-            passable,
-        ))
-
-        return full_cube_matrix.astype(np.float32, copy=False)
+        return np.vstack(matrices)
 
     def _transform_xyz_matrix(
             self,
@@ -218,48 +159,29 @@ class CaptureSceneServer(Node):
         translation = transform.transform.translation
         rotation = transform.transform.rotation
 
-        tx = translation.x
-        ty = translation.y
-        tz = translation.z
+        rotation_matrix = quaternion_to_rotation_matrix(
+            rotation.x,
+            rotation.y,
+            rotation.z,
+            rotation.w,
+        )
 
-        qx = rotation.x
-        qy = rotation.y
-        qz = rotation.z
-        qw = rotation.w
-
-        # Quaternion to rotation matrix
-        r00 = 1.0 - 2.0 * (qy * qy + qz * qz)
-        r01 = 2.0 * (qx * qy - qz * qw)
-        r02 = 2.0 * (qx * qz + qy * qw)
-
-        r10 = 2.0 * (qx * qy + qz * qw)
-        r11 = 1.0 - 2.0 * (qx * qx + qz * qz)
-        r12 = 2.0 * (qy * qz - qx * qw)
-
-        r20 = 2.0 * (qx * qz - qy * qw)
-        r21 = 2.0 * (qy * qz + qx * qw)
-        r22 = 1.0 - 2.0 * (qx * qx + qy * qy)
-
-        rotation_matrix = np.array([
-            [r00, r01, r02],
-            [r10, r11, r12],
-            [r20, r21, r22],
-        ], dtype=np.float64)
-
-        translation_vector = np.array([tx, ty, tz], dtype=np.float64)
-
-        transformed = xyz_matrix.astype(np.float64) @ rotation_matrix.T
-        transformed += translation_vector
-
-        return transformed.astype(np.float32)
+        return transform_points(
+            xyz_matrix,
+            rotation_matrix,
+            [translation.x, translation.y, translation.z],
+        )
 
     def _handle_capture_scene(self, request: CaptureScene.Request, response: CaptureScene.Response) -> CaptureScene.Response:
-        self.get_logger().info(f"Recieved request for voxelization with size: {float(request.voxel_size)}.")
+        self.get_logger().info(f"Received request for voxelization with size: {float(request.voxel_size)}.")
         if request.voxel_size <= 0.0:
             response.success = False
             response.error_msg = 'voxel_size must be greater than 0.'
             response.json_matrix = ''
             return response
+
+        # request.voxel_size is float32, rounding removes its conversion noise
+        voxel_size = round(float(request.voxel_size), 6)
 
         with self._buffer_lock:
             buffered_clouds = list(self._cloud_buffer)
@@ -274,6 +196,25 @@ class CaptureSceneServer(Node):
             return response
 
         try:
+            workspace_min = list(self.get_parameter('workspace_min').value)
+            workspace_max = list(self.get_parameter('workspace_max').value)
+            min_points_per_voxel = int(self.get_parameter('min_points_per_voxel').value)
+            max_voxels = int(self.get_parameter('max_voxels').value)
+
+            min_index, grid_shape = compute_grid(workspace_min, workspace_max, voxel_size)
+            voxel_count = grid_shape[0] * grid_shape[1] * grid_shape[2]
+
+            if voxel_count > max_voxels:
+                response.success = False
+                response.error_msg = (
+                    f'voxel_size {voxel_size} produces {voxel_count} voxels, '
+                    f'max_voxels is {max_voxels}.'
+                )
+                response.json_matrix = ''
+                return response
+
+            time_start = time.perf_counter()
+
             merged_matrix = self._merge_buffered_clouds(buffered_clouds)
 
             if merged_matrix.size == 0:
@@ -281,6 +222,8 @@ class CaptureSceneServer(Node):
                 response.error_msg = 'Merged point cloud is empty.'
                 response.json_matrix = ''
                 return response
+
+            time_converted = time.perf_counter()
 
             source_frame = buffered_clouds[-1].header.frame_id
             target_frame = self.get_parameter('planning_frame').value
@@ -304,39 +247,64 @@ class CaptureSceneServer(Node):
                 response.json_matrix = ''
                 return response
 
-            occupied_cube_matrix = self._voxelize_occupied_points(
-                merged_matrix,
-                request.voxel_size
-            )
+            point_count = merged_matrix.shape[0]
 
-            if occupied_cube_matrix.size == 0:
+            # Workspace bounds are given in target_frame, crop after the transform
+            merged_matrix = crop_to_workspace(merged_matrix, workspace_min, workspace_max)
+
+            if merged_matrix.size == 0:
                 response.success = False
-                response.error_msg = 'Voxelization produced empty occupied cube matrix.'
+                response.error_msg = (
+                    f'No points inside workspace {workspace_min} -> {workspace_max} '
+                    f'in frame {target_frame}.'
+                )
                 response.json_matrix = ''
                 return response
 
-            cube_matrix = self._create_full_cuboid_voxel_matrix(
-                occupied_cube_matrix,
-                request.voxel_size
+            time_transformed = time.perf_counter()
+
+            occupancy = voxelize(
+                merged_matrix,
+                min_index,
+                grid_shape,
+                voxel_size,
+                min_points_per_voxel,
             )
 
-            cube_ids = np.arange(cube_matrix.shape[0], dtype=np.float64).reshape(-1, 1)
-            cube_matrix = np.hstack((cube_ids, cube_matrix.astype(np.float64)))
-            cube_matrix = np.round(cube_matrix.astype(np.float64), decimals=4)
+            if self.get_parameter('fill_below_occupied').value:
+                occupancy = fill_below_occupied(occupancy)
 
-            self.get_logger().info(f"Voxelization succesful.")
+            cube_matrix = occupancy_to_matrix(occupancy, min_index, voxel_size)
+            cube_matrix = np.round(cube_matrix, decimals=4)
+
+            time_voxelized = time.perf_counter()
 
             payload = {
-                'voxel_size': round(float(request.voxel_size), 4),
+                'voxel_size': round(voxel_size, 4),
                 'matrix': cube_matrix.tolist(),
             }
 
             scene_json = json.dumps(payload)
 
+            time_serialized = time.perf_counter()
+
+            self.get_logger().info(
+                f'Voxelization successful. {point_count} points, '
+                f'{merged_matrix.shape[0]} inside workspace, '
+                f'grid {grid_shape[0]}x{grid_shape[1]}x{grid_shape[2]}, '
+                f'{int(occupancy.sum())} occupied voxels.'
+            )
+            self.get_logger().info(
+                f'Timing [s]: convert {time_converted - time_start:.3f}, '
+                f'transform+crop {time_transformed - time_converted:.3f}, '
+                f'voxelize {time_voxelized - time_transformed:.3f}, '
+                f'json {time_serialized - time_voxelized:.3f}'
+            )
+
             with self._scene_lock:
                 self._latest_scene_json = scene_json
                 self._latest_scene_matrix = cube_matrix
-                self._latest_voxel_size = float(request.voxel_size)
+                self._latest_voxel_size = voxel_size
 
             response.success = True
             response.error_msg = ''

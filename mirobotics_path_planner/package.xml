@@ -14,6 +14,10 @@
   <depend>tf2_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>sensor_msgs</depend>
+  <depend>sensor_msgs_py</depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
   <depend>mirobotics_msg</depend>
 
   <test_depend>ament_copyright</test_depend>

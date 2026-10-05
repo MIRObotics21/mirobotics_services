@@ -1,8 +1,12 @@
 import json
+from pathlib import Path
 import threading
-from typing import Optional
+import time
+from typing import Optional, Tuple
 
 import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import ReliabilityPolicy, HistoryPolicy, QoSProfile
 
@@ -18,6 +22,8 @@ import logging
 LOGGER.setLevel(logging.ERROR)
 LOGGER.disabled = True
 
+IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp')
+
 class SceneEvalServer(Node):
     def __init__(self) -> None:
         super().__init__('scene_eval_server')
@@ -26,19 +32,24 @@ class SceneEvalServer(Node):
         self.declare_parameter('min_confidence', 0.25)
         self.declare_parameter('max_detections', 50)
         self.declare_parameter('default_annotated_image_path', '')
-
+        # Maximum accepted age of the evaluated image in seconds. 0 disables the check.
+        self.declare_parameter('max_image_age', 1.0)
 
         self._latest_image_msg: Optional[Image] = None
+        self._latest_image_time: Optional[float] = None
         self._image_lock = threading.Lock()
 
         self._bridge = CvBridge()
         self._model: Optional[YOLO] = None
         self._loaded_model_path: Optional[str] = None
 
+        # Separate group so images keep arriving while a service call is running.
+        self._image_callback_group = MutuallyExclusiveCallbackGroup()
+
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
-            depth=5,
+            depth=1,
         )
 
         self._image_sub = self.create_subscription(
@@ -46,6 +57,7 @@ class SceneEvalServer(Node):
             'image',
             self._image_callback,
             qos,
+            callback_group=self._image_callback_group,
         )
 
         self._service = self.create_service(
@@ -62,17 +74,42 @@ class SceneEvalServer(Node):
     def _image_callback(self, msg: Image) -> None:
         with self._image_lock:
             self._latest_image_msg = msg
+            self._latest_image_time = time.monotonic()
 
-    def _get_latest_image(self) -> Optional[Image]:
+    def _get_latest_image(self) -> Tuple[Optional[Image], Optional[float]]:
+        """Return the latest image and its age in seconds since it was received."""
         with self._image_lock:
-            return self._latest_image_msg
+            if self._latest_image_msg is None:
+                return None, None
+            return self._latest_image_msg, time.monotonic() - self._latest_image_time
 
     def _get_model(self, model_path: str) -> YOLO:
         if self._model is None or self._loaded_model_path != model_path:
             self.get_logger().info(f'Loading model from: {model_path}')
-            self._model = YOLO(model_path)
+            self._model = YOLO(model_path, task='detect')
             self._loaded_model_path = model_path
         return self._model
+
+    def _save_annotated_image(self, annotated, save_path: str) -> None:
+        """
+        save_path with an image extension is used as the file path,
+        anything else is a directory that receives 'annotated.png'.
+        """
+        target = Path(save_path).expanduser()
+        if target.suffix.lower() not in IMAGE_EXTENSIONS:
+            target = target / 'annotated.png'
+
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            ok = cv2.imwrite(str(target), annotated)
+        except (OSError, cv2.error) as exc:
+            self.get_logger().warning(f'Failed to save annotated image {target}: {exc}')
+            return
+
+        if not ok:
+            self.get_logger().warning(f'Failed to save annotated image: {target}')
+        else:
+            self.get_logger().info(f'Saved annotated image: {target}')
 
     def _evaluate_scene(self, model_path: str, cv_image, save_path: str):
         """
@@ -87,7 +124,7 @@ class SceneEvalServer(Node):
             }
         ]
         """
-        model = YOLO(self._get_model(model_path), task='detect')
+        model = self._get_model(model_path)
 
         min_confidence = float(self.get_parameter('min_confidence').value)
         max_detections = int(self.get_parameter('max_detections').value)
@@ -132,13 +169,7 @@ class SceneEvalServer(Node):
             )
 
         if str(save_path) != '':
-            annotated = result.plot()
-            ok = cv2.imwrite(str(save_path)+'anotated.png', annotated)
-
-            if not ok:
-                self.get_logger().info(f"[WARNING] Failed to save annotated image: {save_path}")
-            else:
-                self.get_logger().info(f"Saved annotated image: {save_path}")
+            self._save_annotated_image(result.plot(), str(save_path))
 
         return objects
 
@@ -159,11 +190,22 @@ class SceneEvalServer(Node):
 
         self.get_logger().info(f'Received scene evaluation request with model_path="{model_path}"')
 
-        image_msg = self._get_latest_image()
+        image_msg, image_age = self._get_latest_image()
         if image_msg is None:
             response.success = False
             response.error_msg = 'No image received yet on topic "image".'
             response.json_objects = '[]'
+            return response
+
+        max_image_age = float(self.get_parameter('max_image_age').value)
+        if max_image_age > 0.0 and image_age > max_image_age:
+            response.success = False
+            response.error_msg = (
+                f'Latest image is stale: received {image_age:.2f} s ago, '
+                f'max_image_age is {max_image_age:.2f} s.'
+            )
+            response.json_objects = '[]'
+            self.get_logger().error(response.error_msg)
             return response
 
         try:
@@ -192,9 +234,11 @@ class SceneEvalServer(Node):
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = SceneEvalServer()
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
 
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
