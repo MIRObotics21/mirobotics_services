@@ -70,7 +70,7 @@ ROS 2 interfaces package containing:
 
 ## 2. mirobotics_scene_eval
 
-YOLO-based scene evaluation package.
+YOLO-based scene evaluation package. See the [preparation scripts](https://github.com/MIRObotics21/prep_scripts_for_scene_eval_service.git) repository to create a NN YOLO model.
 
 ### Features
 
