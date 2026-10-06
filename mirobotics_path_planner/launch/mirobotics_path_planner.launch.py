@@ -32,6 +32,8 @@ def generate_launch_description():
                 'workspace_max': [0.5, 0.5, 0.6],
                 'min_points_per_voxel': 3,
                 'fill_below_occupied': True,
+                'max_cloud_age': 2.0,
+                'publish_markers': True,
             }],
             remappings=[
                 ('pointcloud2', pointcloud2_publisher),

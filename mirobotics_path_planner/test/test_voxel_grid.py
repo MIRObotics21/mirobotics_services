@@ -5,6 +5,7 @@ from mirobotics_path_planner.voxel_grid import (
     compute_grid,
     crop_to_workspace,
     fill_below_occupied,
+    grid_description,
     occupancy_to_matrix,
     quaternion_to_rotation_matrix,
     transform_points,
@@ -122,6 +123,26 @@ def test_occupancy_to_matrix_layout():
 
     # the voxel above differs only in z and has the next id
     assert np.allclose(matrix[occupied_id + 1], [occupied_id + 1, 0.05, 0.05, 0.35, 1.0])
+
+
+def test_grid_description_addresses_voxels():
+    min_index, shape = compute_grid(WORKSPACE_MIN, WORKSPACE_MAX, 0.1)
+    matrix = occupancy_to_matrix(np.zeros(shape, dtype=bool), min_index, 0.1)
+
+    grid = grid_description(min_index, shape, 0.1)
+
+    assert grid == {
+        'min_index': [-5, -5, 0],
+        'shape': [10, 10, 6],
+        'origin': [-0.5, -0.5, 0.0],
+    }
+
+    nx, ny, nz = grid['shape']
+    ix, iy, iz = 7, 2, 4
+    voxel_id = (ix * ny + iy) * nz + iz
+    center = np.asarray(grid['origin']) + (np.array([ix, iy, iz]) + 0.5) * 0.1
+
+    assert np.allclose(matrix[voxel_id, 1:4], center)
 
 
 def test_transform_points_uses_camera_mount():

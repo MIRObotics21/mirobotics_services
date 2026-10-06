@@ -82,6 +82,27 @@ def compute_grid(
     return min_index, (int(shape[0]), int(shape[1]), int(shape[2]))
 
 
+def grid_description(
+        min_index: np.ndarray,
+        shape: Tuple[int, int, int],
+        voxel_size: float,
+) -> dict:
+    """
+    JSON-serializable description of the grid layout.
+
+    With it any voxel can be addressed without searching the scene matrix:
+        id = (ix * ny + iy) * nz + iz
+        center = origin + (index + 0.5) * voxel_size
+
+    origin is the minimum corner of the grid.
+    """
+    return {
+        'min_index': [int(i) for i in min_index],
+        'shape': [int(n) for n in shape],
+        'origin': [round(float(i * voxel_size), 6) for i in min_index],
+    }
+
+
 def voxelize(
         xyz_matrix: np.ndarray,
         min_index: np.ndarray,

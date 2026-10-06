@@ -79,6 +79,16 @@ YOLO-based scene evaluation package. See the [preparation scripts](https://githu
 * Object segmentation
 * JSON object output
 
+### Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `default_model_path` | `''` | Model used when the request has an empty `model_path`. Loaded at startup if the file exists. |
+| `default_annotated_image_path` | `''` | Used when the request has an empty `annotated_image_path`. Empty disables saving. |
+| `min_confidence` | `0.25` | Minimum detection confidence. |
+| `max_detections` | `50` | Maximum number of detections per image. |
+| `max_image_age` | `1.0` | Maximum age of the evaluated image in seconds. `0` disables the check. |
+
 ### Launch
 
 ```bash
@@ -97,14 +107,17 @@ mirobotics_msg/srv/EvalScene \
 annotated_image_path: '/home/mirobotics/output/'}"
 ```
 
+`annotated_image_path` ending with an image extension (`.png`, `.jpg`, `.jpeg`, `.bmp`) is used as the file path.
+Anything else is treated as a directory and the image is saved there as `annotated.png`.
+
 ### Example Output
 
 ```text
 success: true
 json_objects:
 [
- {"id":1,"type":"modra","u":715.6,"v":246.4},
- {"id":2,"type":"zelena","u":510.6,"v":96.2}
+ {"id":1,"type":"modra","u":715.6,"v":246.4,"confidence":0.93},
+ {"id":2,"type":"zelena","u":510.6,"v":96.2,"confidence":0.88}
 ]
 ```
 
@@ -117,9 +130,34 @@ Voxelization and 3D A* planning package.
 ### Features
 
 * PointCloud2 voxelization
+* Workspace cropping and noise filtering
 * Occupancy matrix generation
 * 3D A* path planning
 * JSON path output
+* RViz visualization of the voxel grid
+
+### Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `planning_frame` | `''` | Frame of the voxel grid. Empty keeps the point cloud frame. Launch file sets `base_link`. |
+| `workspace_min` | `[-0.5, -0.5, 0.0]` | Minimum corner `[x, y, z]` of the workspace box in `planning_frame`, in meters. |
+| `workspace_max` | `[0.5, 0.5, 0.6]` | Maximum corner `[x, y, z]` of the workspace box in `planning_frame`, in meters. |
+| `min_points_per_voxel` | `3` | Voxel is occupied only if it contains at least this many points. |
+| `fill_below_occupied` | `true` | Marks everything under the highest occupied voxel of a column as occupied. |
+| `max_voxels` | `2000000` | CaptureScene fails if the grid would contain more voxels. |
+| `max_cloud_age` | `2.0` | Maximum age of the buffered point clouds in seconds. `0` disables the check. |
+| `publish_markers` | `true` | Publishes the voxel grid for RViz after each capture. |
+
+The point cloud is transformed into `planning_frame` first, so the workspace box is given in robot coordinates.
+Points outside the box are discarded and the voxel grid always covers the whole box.
+Set `z` of `workspace_min` just below the table top to keep the table as the bottom obstacle layer.
+
+### Visualization
+
+After each capture the occupied voxels and the workspace box are published on
+`voxel_grid_markers` (`visualization_msgs/MarkerArray`).
+In RViz add a `MarkerArray` display and set its Durability Policy to `Transient Local`.
 
 ### Launch
 
@@ -149,8 +187,24 @@ success: true
 json_matrix:
 {
  "voxel_size": 0.1,
+ "grid": {
+  "min_index": [-5, -5, 0],
+  "shape": [10, 10, 6],
+  "origin": [-0.5, -0.5, 0.0],
+  "frame_id": "base_link"
+ },
  "matrix": [...]
 }
+```
+
+Matrix rows are `[id, x, y, z, passable]`, where `passable` is `1.0` for free and `0.0` for occupied voxels.
+
+The grid is fixed by the workspace box and `voxel_size`, so voxel ids do not change between captures.
+With `shape = [nx, ny, nz]` and voxel index `[ix, iy, iz]`:
+
+```text
+id     = (ix * ny + iy) * nz + iz
+center = origin + (index + 0.5) * voxel_size
 ```
 
 ---
@@ -165,6 +219,8 @@ ros2 service call \
 mirobotics_msg/srv/PlanPath \
 "{start_id: 500, goal_id: 2584}"
 ```
+
+Voxel ids depend on the workspace box and `voxel_size` used by the last CaptureScene call.
 
 ### Example Output
 

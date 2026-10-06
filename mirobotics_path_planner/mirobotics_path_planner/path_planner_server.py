@@ -1,14 +1,19 @@
+import itertools
 import json
 import threading
 import time
 from collections import deque
-from typing import Deque
+from typing import Deque, Tuple
 
 import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import ReliabilityPolicy, HistoryPolicy, QoSProfile
+from rclpy.qos import DurabilityPolicy, ReliabilityPolicy, HistoryPolicy, QoSProfile
+from geometry_msgs.msg import Point
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
+from visualization_msgs.msg import Marker, MarkerArray
 import tf2_ros
 
 import numpy as np
@@ -19,6 +24,7 @@ from mirobotics_path_planner.voxel_grid import (
     compute_grid,
     crop_to_workspace,
     fill_below_occupied,
+    grid_description,
     occupancy_to_matrix,
     quaternion_to_rotation_matrix,
     transform_points,
@@ -32,7 +38,8 @@ class CaptureSceneServer(Node):
 
         self._topic_name = 'pointcloud2'
         self._buffer_size = 3
-        self._cloud_buffer: Deque[PointCloud2] = deque(maxlen=self._buffer_size)
+        # (cloud, monotonic receive time)
+        self._cloud_buffer: Deque[Tuple[PointCloud2, float]] = deque(maxlen=self._buffer_size)
         self._buffer_lock = threading.Lock()
 
         self.declare_parameter('planning_frame', '')
@@ -45,6 +52,10 @@ class CaptureSceneServer(Node):
         # Mark everything under the highest occupied voxel of a column as occupied.
         self.declare_parameter('fill_below_occupied', True)
         self.declare_parameter('max_voxels', 2000000)
+        # Maximum accepted age of the oldest buffered cloud in seconds. 0 disables the check.
+        self.declare_parameter('max_cloud_age', 2.0)
+        # Publish occupied voxels and the workspace box for RViz after each capture.
+        self.declare_parameter('publish_markers', True)
 
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
@@ -56,10 +67,13 @@ class CaptureSceneServer(Node):
 
         resolved_topic = self.resolve_topic_name(self._topic_name)
 
+        # Separate group so clouds keep arriving while a service call is running.
+        self._cloud_callback_group = MutuallyExclusiveCallbackGroup()
+
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
-            depth=10,
+            depth=self._buffer_size,
         )
 
         self._subscription = self.create_subscription(
@@ -67,6 +81,21 @@ class CaptureSceneServer(Node):
             self._topic_name,
             self._pointcloud_callback,
             qos,
+            callback_group=self._cloud_callback_group,
+        )
+
+        # Latched, RViz receives the last capture even when started later.
+        marker_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+
+        self._marker_pub = self.create_publisher(
+            MarkerArray,
+            'voxel_grid_markers',
+            marker_qos,
         )
 
         self._capture_scene_service = self.create_service(
@@ -87,7 +116,7 @@ class CaptureSceneServer(Node):
 
     def _pointcloud_callback(self, msg: PointCloud2) -> None:
         with self._buffer_lock:
-            self._cloud_buffer.append(msg)
+            self._cloud_buffer.append((msg, time.monotonic()))
 
         self.get_logger().debug(
             f"Received PointCloud2. Buffered {len(self._cloud_buffer)}/{self._buffer_size} messages."
@@ -172,6 +201,62 @@ class CaptureSceneServer(Node):
             [translation.x, translation.y, translation.z],
         )
 
+    def _publish_markers(
+            self,
+            cube_matrix: np.ndarray,
+            voxel_size: float,
+            workspace_min: list,
+            workspace_max: list,
+            frame_id: str,
+    ) -> None:
+        """
+        Publish occupied voxels as cubes and the workspace box as lines.
+        """
+        occupied = Marker()
+        occupied.header.frame_id = frame_id
+        occupied.ns = 'occupied_voxels'
+        occupied.id = 0
+        occupied.type = Marker.CUBE_LIST
+        occupied.action = Marker.ADD
+        occupied.pose.orientation.w = 1.0
+        occupied.scale.x = voxel_size
+        occupied.scale.y = voxel_size
+        occupied.scale.z = voxel_size
+        occupied.color.r = 0.9
+        occupied.color.g = 0.3
+        occupied.color.b = 0.2
+        occupied.color.a = 0.6
+
+        occupied_centers = cube_matrix[cube_matrix[:, 4] < 0.5][:, 1:4]
+        occupied.points = [
+            Point(x=x, y=y, z=z) for x, y, z in occupied_centers.tolist()
+        ]
+
+        workspace = Marker()
+        workspace.header.frame_id = frame_id
+        workspace.ns = 'workspace'
+        workspace.id = 0
+        workspace.type = Marker.LINE_LIST
+        workspace.action = Marker.ADD
+        workspace.pose.orientation.w = 1.0
+        workspace.scale.x = 0.005
+        workspace.color.g = 1.0
+        workspace.color.a = 1.0
+
+        corners = list(itertools.product(*zip(workspace_min, workspace_max)))
+
+        for corner_a, corner_b in itertools.combinations(corners, 2):
+            # box edges connect corners that differ on exactly one axis
+            if sum(a != b for a, b in zip(corner_a, corner_b)) != 1:
+                continue
+
+            for corner in (corner_a, corner_b):
+                workspace.points.append(
+                    Point(x=float(corner[0]), y=float(corner[1]), z=float(corner[2]))
+                )
+
+        self._marker_pub.publish(MarkerArray(markers=[occupied, workspace]))
+
     def _handle_capture_scene(self, request: CaptureScene.Request, response: CaptureScene.Response) -> CaptureScene.Response:
         self.get_logger().info(f"Received request for voxelization with size: {float(request.voxel_size)}.")
         if request.voxel_size <= 0.0:
@@ -184,16 +269,31 @@ class CaptureSceneServer(Node):
         voxel_size = round(float(request.voxel_size), 6)
 
         with self._buffer_lock:
-            buffered_clouds = list(self._cloud_buffer)
+            buffered = list(self._cloud_buffer)
 
-        if len(buffered_clouds) < self._buffer_size:
+        if len(buffered) < self._buffer_size:
             response.success = False
             response.error_msg = (
                 f'Not enough point clouds buffered yet. '
-                f'Expected {self._buffer_size}, got {len(buffered_clouds)}.'
+                f'Expected {self._buffer_size}, got {len(buffered)}.'
             )
             response.json_matrix = ''
             return response
+
+        max_cloud_age = float(self.get_parameter('max_cloud_age').value)
+        oldest_cloud_age = time.monotonic() - buffered[0][1]
+
+        if max_cloud_age > 0.0 and oldest_cloud_age > max_cloud_age:
+            response.success = False
+            response.error_msg = (
+                f'Buffered point clouds are stale: oldest received {oldest_cloud_age:.2f} s ago, '
+                f'max_cloud_age is {max_cloud_age:.2f} s.'
+            )
+            response.json_matrix = ''
+            self.get_logger().error(response.error_msg)
+            return response
+
+        buffered_clouds = [cloud for cloud, _ in buffered]
 
         try:
             workspace_min = list(self.get_parameter('workspace_min').value)
@@ -279,8 +379,12 @@ class CaptureSceneServer(Node):
 
             time_voxelized = time.perf_counter()
 
+            grid = grid_description(min_index, grid_shape, voxel_size)
+            grid['frame_id'] = target_frame
+
             payload = {
                 'voxel_size': round(voxel_size, 4),
+                'grid': grid,
                 'matrix': cube_matrix.tolist(),
             }
 
@@ -305,6 +409,18 @@ class CaptureSceneServer(Node):
                 self._latest_scene_json = scene_json
                 self._latest_scene_matrix = cube_matrix
                 self._latest_voxel_size = voxel_size
+
+            if self.get_parameter('publish_markers').value:
+                try:
+                    self._publish_markers(
+                        cube_matrix,
+                        voxel_size,
+                        workspace_min,
+                        workspace_max,
+                        target_frame,
+                    )
+                except Exception as exc:
+                    self.get_logger().warning(f'Failed to publish voxel markers: {exc}')
 
             response.success = True
             response.error_msg = ''
@@ -358,9 +474,11 @@ class CaptureSceneServer(Node):
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = CaptureSceneServer()
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
 
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

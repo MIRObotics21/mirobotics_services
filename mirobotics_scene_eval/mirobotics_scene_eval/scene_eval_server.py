@@ -14,6 +14,7 @@ from mirobotics_msg.srv import EvalScene
 from sensor_msgs.msg import Image
 
 import cv2
+import numpy as np
 from cv_bridge import CvBridge, CvBridgeError
 from ultralytics import YOLO
 from ultralytics.utils import LOGGER
@@ -66,6 +67,8 @@ class SceneEvalServer(Node):
             self._handle_eval_scene,
         )
 
+        self._preload_default_model()
+
         resolved_topic = self.resolve_topic_name('image')
         self.get_logger().info(
             f'SceneEval server started. Subscribing to: {resolved_topic}'
@@ -89,6 +92,38 @@ class SceneEvalServer(Node):
             self._model = YOLO(model_path, task='detect')
             self._loaded_model_path = model_path
         return self._model
+
+    def _preload_default_model(self) -> None:
+        """
+        Load default_model_path at startup so the first request is not delayed
+        and a wrong path is reported immediately.
+        """
+        model_path = str(self.get_parameter('default_model_path').value).strip()
+
+        if not model_path:
+            return
+
+        if not Path(model_path).is_file():
+            self.get_logger().warning(
+                f'default_model_path does not exist: {model_path}. '
+                f'Model will be loaded on request.'
+            )
+            return
+
+        try:
+            model = self._get_model(model_path)
+            # Dummy inference, the runtime is initialized on the first predict
+            model.predict(
+                source=np.zeros((480, 640, 3), dtype=np.uint8),
+                verbose=False,
+            )
+        except Exception as exc:
+            self._model = None
+            self._loaded_model_path = None
+            self.get_logger().error(f'Failed to preload model {model_path}: {exc}')
+            return
+
+        self.get_logger().info(f'Model preloaded: {model_path}')
 
     def _save_annotated_image(self, annotated, save_path: str) -> None:
         """
