@@ -1,9 +1,10 @@
 import itertools
 import json
+import math
 import threading
 import time
 from collections import deque
-from typing import Deque, Tuple
+from typing import Deque, List, Optional, Tuple
 
 import rclpy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
@@ -25,7 +26,11 @@ from mirobotics_path_planner.voxel_grid import (
     crop_to_workspace,
     fill_below_occupied,
     grid_description,
+    grid_index_to_center,
+    grid_index_to_id,
+    id_to_grid_index,
     occupancy_to_matrix,
+    point_to_grid_index,
     quaternion_to_rotation_matrix,
     transform_points,
     voxelize,
@@ -56,13 +61,22 @@ class CaptureSceneServer(Node):
         self.declare_parameter('max_cloud_age', 2.0)
         # Publish occupied voxels and the workspace box for RViz after each capture.
         self.declare_parameter('publish_markers', True)
+        # PlanPath: free voxels inside a (2 * clearance_voxels + 1)^3 cube around an
+        # occupied voxel cost clearance_cost times more to enter.
+        self.declare_parameter('clearance_voxels', 2)
+        self.declare_parameter('clearance_cost', 5.0)
+        # PlanPath: an occupied start or goal point is moved to the nearest free
+        # voxel within this distance in meters.
+        self.declare_parameter('snap_distance', 0.05)
 
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
 
         self._latest_scene_json = None
-        self._latest_scene_matrix = None
+        self._latest_occupancy = None
+        self._latest_min_index = None
         self._latest_voxel_size = None
+        self._latest_frame = None
         self._scene_lock = threading.Lock()
 
         resolved_topic = self.resolve_topic_name(self._topic_name)
@@ -95,6 +109,12 @@ class CaptureSceneServer(Node):
         self._marker_pub = self.create_publisher(
             MarkerArray,
             'voxel_grid_markers',
+            marker_qos,
+        )
+
+        self._path_marker_pub = self.create_publisher(
+            MarkerArray,
+            'planned_path_markers',
             marker_qos,
         )
 
@@ -407,8 +427,10 @@ class CaptureSceneServer(Node):
 
             with self._scene_lock:
                 self._latest_scene_json = scene_json
-                self._latest_scene_matrix = cube_matrix
+                self._latest_occupancy = occupancy
+                self._latest_min_index = min_index
                 self._latest_voxel_size = voxel_size
+                self._latest_frame = target_frame
 
             if self.get_parameter('publish_markers').value:
                 try:
@@ -434,41 +456,199 @@ class CaptureSceneServer(Node):
             response.json_matrix = ''
             return response
 
-    def _handle_plan_path(self, request, response):
+    def _resolve_endpoint(
+            self,
+            name: str,
+            voxel_id: int,
+            point,
+            planner: AStar3D,
+            min_index: np.ndarray,
+            voxel_size: float,
+            snap_radius: int,
+    ) -> Tuple[Tuple[int, int, int], Optional[Tuple[float, float, float]], bool]:
+        """
+        Resolve a start or goal given by voxel id (id >= 0) or by point (id == -1).
+
+        Returns:
+            grid index of the free voxel to plan from or to
+            requested point, None when the voxel id was used
+            True if the point was occupied and moved to the nearest free voxel
+        """
+        if voxel_id >= 0:
+            index = id_to_grid_index(voxel_id, planner.shape)
+
+            if not planner.is_free(index):
+                raise ValueError(f'{name}_id {voxel_id} is occupied.')
+
+            return index, None, False
+
+        requested = (float(point.x), float(point.y), float(point.z))
+        index = point_to_grid_index(requested, min_index, voxel_size)
+
+        if not planner.in_grid(index):
+            raise ValueError(
+                f'{name}_point {requested} is outside the voxel grid. '
+                f'Check workspace_min and workspace_max.'
+            )
+
+        free_index = planner.nearest_free(index, snap_radius)
+
+        if free_index is None:
+            raise ValueError(
+                f'{name}_point {requested} is occupied and there is no free voxel '
+                f'within snap_distance.'
+            )
+
+        snapped = free_index != index
+
+        if snapped:
+            self.get_logger().info(
+                f'{name}_point {requested} is occupied, using nearest free voxel '
+                f'{grid_index_to_id(free_index, planner.shape)}.'
+            )
+
+        return free_index, requested, snapped
+
+    def _publish_path_markers(
+            self,
+            path_points: List[Tuple[float, float, float]],
+            waypoints: List[Tuple[float, float, float]],
+            voxel_size: float,
+            frame_id: str,
+    ) -> None:
+        """
+        Publish the full voxel path as a thin line and the waypoints as a thick line with spheres.
+        """
+        markers = []
+
+        for marker_id, (ns, points, width, color) in enumerate((
+                ('voxel_path', path_points, 0.004, (0.2, 0.4, 1.0)),
+                ('waypoint_path', waypoints, 0.01, (1.0, 0.85, 0.1)),
+        )):
+            line = Marker()
+            line.header.frame_id = frame_id
+            line.ns = ns
+            line.id = marker_id
+            line.type = Marker.LINE_STRIP
+            line.action = Marker.ADD
+            line.pose.orientation.w = 1.0
+            line.scale.x = width
+            line.color.r, line.color.g, line.color.b = color
+            line.color.a = 1.0
+            line.points = [Point(x=x, y=y, z=z) for x, y, z in points]
+            markers.append(line)
+
+        spheres = Marker()
+        spheres.header.frame_id = frame_id
+        spheres.ns = 'waypoints'
+        spheres.id = 2
+        spheres.type = Marker.SPHERE_LIST
+        spheres.action = Marker.ADD
+        spheres.pose.orientation.w = 1.0
+        sphere_size = max(voxel_size * 0.4, 0.01)
+        spheres.scale.x = sphere_size
+        spheres.scale.y = sphere_size
+        spheres.scale.z = sphere_size
+        spheres.color.r, spheres.color.g, spheres.color.b = (1.0, 0.85, 0.1)
+        spheres.color.a = 1.0
+        spheres.points = [Point(x=x, y=y, z=z) for x, y, z in waypoints]
+        markers.append(spheres)
+
+        self._path_marker_pub.publish(MarkerArray(markers=markers))
+
+    def _handle_plan_path(self, request: PlanPath.Request, response: PlanPath.Response) -> PlanPath.Response:
+        response.json_path = ''
+        response.waypoints = []
+
         with self._scene_lock:
-            if self._latest_scene_matrix is None:
+            if self._latest_occupancy is None:
                 response.success = False
                 response.error_msg = 'No captured scene available. Call CaptureScene first.'
-                response.json_path = ''
                 return response
 
-            scene_matrix = self._latest_scene_matrix.copy()
+            occupancy = self._latest_occupancy
+            min_index = self._latest_min_index
             voxel_size = self._latest_voxel_size
+            frame_id = self._latest_frame
 
         try:
-            planner = AStar3D(scene_matrix, voxel_size)
-            path = planner.plan(request.start_id, request.goal_id)
+            time_start = time.perf_counter()
+
+            planner = AStar3D(
+                occupancy,
+                clearance_voxels=int(self.get_parameter('clearance_voxels').value),
+                clearance_cost=float(self.get_parameter('clearance_cost').value),
+            )
+
+            snap_radius = int(math.ceil(
+                float(self.get_parameter('snap_distance').value) / voxel_size - 1e-6
+            ))
+
+            start, start_point, start_snapped = self._resolve_endpoint(
+                'start', request.start_id, request.start_point,
+                planner, min_index, voxel_size, snap_radius,
+            )
+            goal, goal_point, goal_snapped = self._resolve_endpoint(
+                'goal', request.goal_id, request.goal_point,
+                planner, min_index, voxel_size, snap_radius,
+            )
+
+            path = planner.plan(start, goal)
 
             if not path:
                 response.success = False
                 response.error_msg = 'No path found.'
-                response.json_path = ''
                 return response
+
+            simplified = planner.simplify(path)
+
+            time_planned = time.perf_counter()
+
+            path_points = [grid_index_to_center(index, min_index, voxel_size) for index in path]
+            waypoints = [grid_index_to_center(index, min_index, voxel_size) for index in simplified]
+
+            # The robot is at the exact start point, keep it as the first waypoint
+            if start_point is not None:
+                if start_snapped or len(waypoints) == 1:
+                    waypoints.insert(0, start_point)
+                else:
+                    waypoints[0] = start_point
+
+            # An occupied goal point cannot be reached, the snapped voxel center is used instead
+            if goal_point is not None and not goal_snapped:
+                waypoints[-1] = goal_point
+
+            rows = [
+                [grid_index_to_id(index, planner.shape)] + [round(c, 4) for c in center] + [1.0]
+                for index, center in zip(path, path_points)
+            ]
 
             payload = {
                 'columns': ['id', 'x', 'y', 'z', 'passable'],
-                'path': path,
+                'path': rows,
             }
+
+            self.get_logger().info(
+                f'Path found: {len(path)} voxels, {len(waypoints)} waypoints, '
+                f'planned in {time_planned - time_start:.3f} s.'
+            )
+
+            if self.get_parameter('publish_markers').value:
+                try:
+                    self._publish_path_markers(path_points, waypoints, voxel_size, frame_id)
+                except Exception as exc:
+                    self.get_logger().warning(f'Failed to publish path markers: {exc}')
 
             response.success = True
             response.error_msg = ''
             response.json_path = json.dumps(payload)
+            response.waypoints = [Point(x=x, y=y, z=z) for x, y, z in waypoints]
             return response
 
         except Exception as exc:
+            self.get_logger().error(f'PlanPath failed: {exc}')
             response.success = False
             response.error_msg = str(exc)
-            response.json_path = ''
             return response
 
 def main(args=None) -> None:

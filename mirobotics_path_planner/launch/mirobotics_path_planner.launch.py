@@ -34,6 +34,9 @@ def generate_launch_description():
                 'fill_below_occupied': True,
                 'max_cloud_age': 2.0,
                 'publish_markers': True,
+                'clearance_voxels': 2,
+                'clearance_cost': 5.0,
+                'snap_distance': 0.05,
             }],
             remappings=[
                 ('pointcloud2', pointcloud2_publisher),

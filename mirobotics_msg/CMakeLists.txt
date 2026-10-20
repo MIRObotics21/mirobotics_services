@@ -11,6 +11,7 @@ find_package(rosidl_default_generators REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/EvalScene.srv"
@@ -18,6 +19,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/CaptureScene.srv"
   "action/GenerateScene.action"
   "action/PlanAndExecute.action"
+  DEPENDENCIES geometry_msgs
 )
 
 if(BUILD_TESTING)

@@ -147,7 +147,10 @@ Voxelization and 3D A* planning package.
 | `fill_below_occupied` | `true` | Marks everything under the highest occupied voxel of a column as occupied. |
 | `max_voxels` | `2000000` | CaptureScene fails if the grid would contain more voxels. |
 | `max_cloud_age` | `2.0` | Maximum age of the buffered point clouds in seconds. `0` disables the check. |
-| `publish_markers` | `true` | Publishes the voxel grid for RViz after each capture. |
+| `publish_markers` | `true` | Publishes the voxel grid after each capture and the path after each plan for RViz. |
+| `clearance_voxels` | `2` | PlanPath: free voxels inside a `(2 * clearance_voxels + 1)^3` cube around an occupied voxel form the clearance zone. `2` gives a 5x5x5 cube. |
+| `clearance_cost` | `5.0` | PlanPath: entering a clearance zone voxel costs this many times more. `1.0` disables the clearance. |
+| `snap_distance` | `0.05` | PlanPath: an occupied start or goal point is moved to the nearest free voxel within this distance in meters. |
 
 The point cloud is transformed into `planning_frame` first, so the workspace box is given in robot coordinates.
 Points outside the box are discarded and the voxel grid always covers the whole box.
@@ -157,7 +160,9 @@ Set `z` of `workspace_min` just below the table top to keep the table as the bot
 
 After each capture the occupied voxels and the workspace box are published on
 `voxel_grid_markers` (`visualization_msgs/MarkerArray`).
-In RViz add a `MarkerArray` display and set its Durability Policy to `Transient Local`.
+After each successful PlanPath call the full voxel path (thin blue line) and the
+waypoints (thick yellow line with spheres) are published on `planned_path_markers`.
+In RViz add a `MarkerArray` display per topic and set its Durability Policy to `Transient Local`.
 
 ### Launch
 
@@ -211,13 +216,35 @@ center = origin + (index + 0.5) * voxel_size
 
 # PlanPath Service
 
+PlanPath plans on the voxel grid of the last CaptureScene call, so CaptureScene must be called first.
+
+Start and goal are each given either by voxel id or by point in the planning frame.
+A voxel id of `-1` (the default) means the corresponding point is used.
+An occupied point is moved to the nearest free voxel within `snap_distance`; a point outside the workspace box is an error.
+
+The planner is A* with 26-neighbour moves (costs `1`, `√2`, `√3`). Diagonal moves never cut a corner of an occupied voxel.
+Moves into the clearance zone around obstacles cost `clearance_cost` times more, so the path keeps its distance
+where possible but can still reach start and goal voxels close to obstacles.
+
 ### Usage
+
+By voxel ids:
 
 ```bash
 ros2 service call \
 /plan_path \
 mirobotics_msg/srv/PlanPath \
 "{start_id: 500, goal_id: 2584}"
+```
+
+By points:
+
+```bash
+ros2 service call \
+/plan_path \
+mirobotics_msg/srv/PlanPath \
+"{start_point: {x: -0.3, y: -0.3, z: 0.4},
+goal_point: {x: 0.21, y: 0.13, z: 0.13}}"
 ```
 
 Voxel ids depend on the workspace box and `voxel_size` used by the last CaptureScene call.
@@ -231,7 +258,21 @@ json_path:
  "columns": ["id","x","y","z","passable"],
  "path": [...]
 }
+waypoints:
+- x: -0.3
+  y: -0.3
+  z: 0.4
+- x: 0.21
+  y: 0.13
+  z: 0.13
 ```
+
+`json_path` contains every voxel of the path.
+`waypoints` is the simplified path: the start, the points where the path changes direction and the goal.
+A section of the path is replaced by a straight line only if the line stays clear of obstacles
+and does not enter the clearance zone where the original path avoided it.
+When a point was given, the exact point is used as the first or last waypoint instead of the voxel center
+(a snapped goal uses the center of the free voxel).
 
 ---
 

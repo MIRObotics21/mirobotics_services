@@ -1,6 +1,15 @@
-int64 start_id
-int64 goal_id
+# Start and goal are given either by voxel id or by point.
+# A voxel id of -1 means the corresponding point is used instead.
+int64 start_id -1
+int64 goal_id -1
+# Points in the planning frame of the captured scene, in meters.
+# An occupied point is moved to the nearest free voxel within snap_distance.
+geometry_msgs/Point start_point
+geometry_msgs/Point goal_point
 ---
 bool success
 string error_msg
+# Full voxel path, columns [id, x, y, z, passable]
 string json_path
+# Simplified path: start, points where the path changes direction, goal
+geometry_msgs/Point[] waypoints

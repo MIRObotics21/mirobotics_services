@@ -6,7 +6,11 @@ from mirobotics_path_planner.voxel_grid import (
     crop_to_workspace,
     fill_below_occupied,
     grid_description,
+    grid_index_to_center,
+    grid_index_to_id,
+    id_to_grid_index,
     occupancy_to_matrix,
+    point_to_grid_index,
     quaternion_to_rotation_matrix,
     transform_points,
     voxelize,
@@ -167,14 +171,36 @@ def test_matrix_is_plannable_around_obstacle():
     ])
 
     occupancy = fill_below_occupied(voxelize(wall, min_index, shape, 0.1))
-    matrix = np.round(occupancy_to_matrix(occupancy, min_index, 0.1), decimals=4)
 
-    start_id = (2 * 10 + 5) * 6 + 0
-    goal_id = (8 * 10 + 5) * 6 + 0
+    start = id_to_grid_index((2 * 10 + 5) * 6 + 0, shape)
+    goal = point_to_grid_index([0.35, 0.05, 0.05], min_index, 0.1)
 
-    path = AStar3D(matrix, 0.1).plan(start_id, goal_id)
+    path = AStar3D(occupancy).plan(start, goal)
 
-    assert path[0][0] == start_id
-    assert path[-1][0] == goal_id
-    assert all(row[4] == 1.0 for row in path)
-    assert max(row[3] for row in path) > 0.3
+    assert path[0] == start
+    assert path[-1] == goal
+    assert grid_index_to_id(goal, shape) == (8 * 10 + 5) * 6 + 0
+    assert not any(occupancy[index] for index in path)
+    assert max(grid_index_to_center(index, min_index, 0.1)[2] for index in path) > 0.3
+
+
+def test_index_conversions_round_trip():
+    min_index, shape = compute_grid(WORKSPACE_MIN, WORKSPACE_MAX, 0.1)
+
+    index = point_to_grid_index([0.02, 0.03, 0.25], min_index, 0.1)
+    assert index == (5, 5, 2)
+    assert np.allclose(grid_index_to_center(index, min_index, 0.1), [0.05, 0.05, 0.25])
+
+    voxel_id = grid_index_to_id(index, shape)
+    assert voxel_id == (5 * 10 + 5) * 6 + 2
+    assert id_to_grid_index(voxel_id, shape) == index
+
+    # point outside the workspace maps outside the grid
+    assert point_to_grid_index([0.0, 0.0, 0.9], min_index, 0.1)[2] >= shape[2]
+
+    for bad_id in (-1, 600):
+        try:
+            id_to_grid_index(bad_id, shape)
+        except ValueError:
+            continue
+        raise AssertionError(f'id_to_grid_index accepted {bad_id}')

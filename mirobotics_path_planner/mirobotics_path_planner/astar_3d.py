@@ -1,167 +1,307 @@
 import heapq
+import itertools
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
 
-VoxelIndex = Tuple[int, int, int]
+GridIndex = Tuple[int, int, int]
+
+SQRT2 = math.sqrt(2.0)
+SQRT3 = math.sqrt(3.0)
+
+# Offsets of a point inside a voxel used for line-of-sight checks.
+# Checking a thin tube around the line instead of the line itself prevents
+# shortcuts that squeeze between two occupied voxels touching at an edge.
+_TUBE_OFFSETS = np.array(list(itertools.product((-0.25, 0.25), repeat=3)))
+
+
+def dilate_cube(occupancy: np.ndarray, radius: int) -> np.ndarray:
+    """
+    Mark every voxel inside a (2 * radius + 1)^3 cube around an occupied voxel.
+    """
+    dilated = occupancy.astype(bool, copy=True)
+
+    for axis in range(3):
+        source = dilated.copy()
+
+        for shift in range(1, radius + 1):
+            if shift >= dilated.shape[axis]:
+                break
+
+            forward = [slice(None)] * 3
+            backward = [slice(None)] * 3
+            forward[axis] = slice(shift, None)
+            backward[axis] = slice(None, -shift)
+
+            dilated[tuple(forward)] |= source[tuple(backward)]
+            dilated[tuple(backward)] |= source[tuple(forward)]
+
+    return dilated
 
 
 class AStar3D:
-    def __init__(self, scene_matrix: np.ndarray, voxel_size: float) -> None:
+    def __init__(
+            self,
+            occupancy: np.ndarray,
+            clearance_voxels: int = 2,
+            clearance_cost: float = 5.0,
+    ) -> None:
         """
-        scene_matrix columns:
-        [id, x, y, z, passable]
+        A* over a boolean occupancy grid with 26-neighbour connectivity.
 
-        passable:
-        1.0 = free
-        0.0 = occupied
+        occupancy:
+        True = occupied, never entered
+        False = free
+
+        Free voxels within clearance_voxels of an occupied voxel (a
+        (2 * clearance_voxels + 1)^3 cube) form the clearance zone. Entering a
+        voxel of the clearance zone costs clearance_cost times the move length,
+        so paths keep distance from obstacles where possible but can still
+        reach start and goal voxels close to them.
         """
-        if scene_matrix.size == 0:
-            raise ValueError("Scene matrix is empty.")
+        if occupancy.ndim != 3 or occupancy.size == 0:
+            raise ValueError('occupancy must be a non-empty 3D array.')
 
-        if scene_matrix.shape[1] != 5:
-            raise ValueError("Scene matrix must have columns [id, x, y, z, passable].")
+        if clearance_voxels < 0:
+            raise ValueError('clearance_voxels must be 0 or greater.')
 
-        if voxel_size <= 0.0:
-            raise ValueError("voxel_size must be greater than 0.")
+        if clearance_cost < 1.0:
+            raise ValueError('clearance_cost must be 1.0 or greater.')
 
-        self.scene_matrix = scene_matrix
-        self.voxel_size = float(voxel_size)
+        self.occupancy = occupancy.astype(bool, copy=False)
+        self.shape: GridIndex = tuple(int(n) for n in occupancy.shape)
+        self.clearance_cost = float(clearance_cost)
 
-        self.id_to_row: Dict[int, np.ndarray] = {}
-        self.id_to_index: Dict[int, VoxelIndex] = {}
-        self.index_to_id: Dict[VoxelIndex, int] = {}
-        self.passable_ids = set()
+        if clearance_voxels > 0:
+            self.clearance_zone = dilate_cube(self.occupancy, clearance_voxels) & ~self.occupancy
+        else:
+            self.clearance_zone = np.zeros(self.shape, dtype=bool)
 
-        self._build_maps()
+        # Pad by one occupied voxel so neighbours never leave the grid
+        padded_shape = tuple(n + 2 for n in self.shape)
 
-    def _build_maps(self) -> None:
-        for row in self.scene_matrix:
-            cube_id = int(row[0])
-            x = float(row[1])
-            y = float(row[2])
-            z = float(row[3])
-            passable = float(row[4])
+        blocked = np.ones(padded_shape, dtype=np.uint8)
+        blocked[1:-1, 1:-1, 1:-1] = self.occupancy
 
-            voxel_index = self._center_to_index(x, y, z)
+        zone = np.zeros(padded_shape, dtype=np.uint8)
+        zone[1:-1, 1:-1, 1:-1] = self.clearance_zone
 
-            self.id_to_row[cube_id] = row
-            self.id_to_index[cube_id] = voxel_index
-            self.index_to_id[voxel_index] = cube_id
+        # Plain bytearrays are much faster to index from Python than NumPy arrays
+        self._blocked = bytearray(blocked.ravel().tobytes())
+        self._zone = bytearray(zone.ravel().tobytes())
 
-            if passable >= 0.5:
-                self.passable_ids.add(cube_id)
+        self._stride_x = padded_shape[1] * padded_shape[2]
+        self._stride_y = padded_shape[2]
+        self._moves = self._build_moves()
 
-    def _center_to_index(self, x: float, y: float, z: float) -> VoxelIndex:
-        ix = int(round(x / self.voxel_size - 0.5))
-        iy = int(round(y / self.voxel_size - 0.5))
-        iz = int(round(z / self.voxel_size - 0.5))
-        return ix, iy, iz
+    def _to_flat(self, index: GridIndex) -> int:
+        return (index[0] + 1) * self._stride_x + (index[1] + 1) * self._stride_y + (index[2] + 1)
 
-    def _heuristic(self, a: VoxelIndex, b: VoxelIndex) -> float:
-        dx = a[0] - b[0]
-        dy = a[1] - b[1]
-        dz = a[2] - b[2]
-        return math.sqrt(dx * dx + dy * dy + dz * dz)
+    def _to_index(self, flat: int) -> GridIndex:
+        ix, rest = divmod(flat, self._stride_x)
+        iy, iz = divmod(rest, self._stride_y)
+        return ix - 1, iy - 1, iz - 1
 
-    def _neighbors_6(self, voxel_index: VoxelIndex) -> List[VoxelIndex]:
-        x, y, z = voxel_index
-        return [
-            (x + 1, y, z),
-            (x - 1, y, z),
-            (x, y + 1, z),
-            (x, y - 1, z),
-            (x, y, z + 1),
-            (x, y, z - 1),
-        ]
+    def _build_moves(self) -> List[Tuple[int, float, Tuple[int, ...]]]:
+        """
+        Returns (flat offset, move length, offsets that must be free) per move.
 
-    def _reconstruct_path(
-        self,
-        came_from: Dict[VoxelIndex, VoxelIndex],
-        current: VoxelIndex,
-    ) -> List[int]:
-        path_indices = [current]
+        A diagonal move is allowed only if every axis-aligned and edge move it is
+        composed of is free, so the path never cuts a corner of an occupied voxel.
+        """
+        strides = (self._stride_x, self._stride_y, 1)
+        moves = []
 
-        while current in came_from:
-            current = came_from[current]
-            path_indices.append(current)
-
-        path_indices.reverse()
-
-        return [self.index_to_id[idx] for idx in path_indices]
-
-    def plan(self, start_id: int, goal_id: int) -> List[List[float]]:
-        if start_id not in self.id_to_index:
-            raise ValueError(f"start_id {start_id} does not exist in scene.")
-
-        if goal_id not in self.id_to_index:
-            raise ValueError(f"goal_id {goal_id} does not exist in scene.")
-
-        if start_id not in self.passable_ids:
-            raise ValueError(f"start_id {start_id} is not passable.")
-
-        if goal_id not in self.passable_ids:
-            raise ValueError(f"goal_id {goal_id} is not passable.")
-
-        start = self.id_to_index[start_id]
-        goal = self.id_to_index[goal_id]
-
-        open_heap = []
-        heapq.heappush(open_heap, (0.0, start))
-
-        came_from: Dict[VoxelIndex, VoxelIndex] = {}
-
-        g_score: Dict[VoxelIndex, float] = {
-            start: 0.0
-        }
-
-        visited = set()
-
-        while open_heap:
-            _, current = heapq.heappop(open_heap)
-
-            if current in visited:
+        for step in itertools.product((-1, 0, 1), repeat=3):
+            if step == (0, 0, 0):
                 continue
 
-            if current == goal:
-                path_ids = self._reconstruct_path(came_from, current)
-                return self._path_ids_to_rows(path_ids)
+            axes = [axis for axis in range(3) if step[axis] != 0]
+            offset = sum(step[axis] * strides[axis] for axis in axes)
+            length = math.sqrt(len(axes))
 
-            visited.add(current)
+            required = []
+            for count in range(1, len(axes)):
+                for subset in itertools.combinations(axes, count):
+                    required.append(sum(step[axis] * strides[axis] for axis in subset))
 
-            for neighbor in self._neighbors_6(current):
-                neighbor_id: Optional[int] = self.index_to_id.get(neighbor)
+            moves.append((offset, length, tuple(required)))
 
-                if neighbor_id is None:
+        return moves
+
+    def in_grid(self, index: Sequence[int]) -> bool:
+        return all(0 <= int(index[axis]) < self.shape[axis] for axis in range(3))
+
+    def is_free(self, index: Sequence[int]) -> bool:
+        return self.in_grid(index) and not self.occupancy[tuple(int(i) for i in index)]
+
+    def cost_factor(self, index: Sequence[int]) -> float:
+        if self.clearance_zone[tuple(int(i) for i in index)]:
+            return self.clearance_cost
+        return 1.0
+
+    def nearest_free(self, index: Sequence[int], max_radius: int) -> Optional[GridIndex]:
+        """
+        Closest free voxel within max_radius voxels (cube), preferring higher voxels on ties.
+        Returns None when there is none.
+        """
+        if not self.in_grid(index):
+            return None
+
+        index = tuple(int(i) for i in index)
+
+        if not self.occupancy[index]:
+            return index
+
+        lower = [max(index[axis] - max_radius, 0) for axis in range(3)]
+        upper = [min(index[axis] + max_radius + 1, self.shape[axis]) for axis in range(3)]
+
+        window = self.occupancy[lower[0]:upper[0], lower[1]:upper[1], lower[2]:upper[2]]
+        candidates = np.argwhere(~window) + np.asarray(lower)
+
+        if candidates.size == 0:
+            return None
+
+        delta = candidates - np.asarray(index)
+        distances = np.sum(delta * delta, axis=1)
+
+        # lexsort uses the last key as primary: distance first, then higher z
+        best = np.lexsort((-delta[:, 2], distances))[0]
+
+        return tuple(int(i) for i in candidates[best])
+
+    def _heuristic(self, flat: int, goal: GridIndex) -> float:
+        """3D octile distance, exact for 26-neighbour moves in free space."""
+        ix, rest = divmod(flat, self._stride_x)
+        iy, iz = divmod(rest, self._stride_y)
+
+        d = sorted((abs(ix - 1 - goal[0]), abs(iy - 1 - goal[1]), abs(iz - 1 - goal[2])))
+
+        return SQRT3 * d[0] + SQRT2 * (d[1] - d[0]) + (d[2] - d[1])
+
+    def plan(self, start: Sequence[int], goal: Sequence[int]) -> List[GridIndex]:
+        """
+        Returns the list of grid indices from start to goal, both included.
+        Returns an empty list when the goal cannot be reached.
+        """
+        start = tuple(int(i) for i in start)
+        goal = tuple(int(i) for i in goal)
+
+        for name, index in (('start', start), ('goal', goal)):
+            if not self.in_grid(index):
+                raise ValueError(f'{name} voxel {index} is outside the grid {self.shape}.')
+            if self.occupancy[index]:
+                raise ValueError(f'{name} voxel {index} is occupied.')
+
+        start_flat = self._to_flat(start)
+        goal_flat = self._to_flat(goal)
+
+        blocked = self._blocked
+        zone = self._zone
+        moves = self._moves
+        clearance_cost = self.clearance_cost
+
+        closed = bytearray(len(blocked))
+        g_score = {start_flat: 0.0}
+        came_from = {}
+
+        # (f, -g, voxel): on equal f the deeper node is expanded first
+        open_heap = [(self._heuristic(start_flat, goal), 0.0, start_flat)]
+
+        while open_heap:
+            _, negative_g, current = heapq.heappop(open_heap)
+
+            if closed[current]:
+                continue
+
+            if current == goal_flat:
+                return self._reconstruct_path(came_from, current)
+
+            closed[current] = 1
+            current_g = -negative_g
+
+            for offset, length, required in moves:
+                neighbor = current + offset
+
+                if blocked[neighbor] or closed[neighbor]:
                     continue
 
-                if neighbor_id not in self.passable_ids:
+                if required and any(blocked[current + r] for r in required):
                     continue
 
-                tentative_g_score = g_score[current] + 1.0
+                tentative_g = current_g + (length * clearance_cost if zone[neighbor] else length)
 
-                if tentative_g_score < g_score.get(neighbor, float("inf")):
+                if tentative_g < g_score.get(neighbor, math.inf):
+                    g_score[neighbor] = tentative_g
                     came_from[neighbor] = current
-                    g_score[neighbor] = tentative_g_score
-
-                    f_score = tentative_g_score + self._heuristic(neighbor, goal)
-                    heapq.heappush(open_heap, (f_score, neighbor))
+                    heapq.heappush(
+                        open_heap,
+                        (tentative_g + self._heuristic(neighbor, goal), -tentative_g, neighbor),
+                    )
 
         return []
 
-    def _path_ids_to_rows(self, path_ids: List[int]) -> List[List[float]]:
-        path = []
+    def _reconstruct_path(self, came_from: dict, current: int) -> List[GridIndex]:
+        path = [current]
 
-        for cube_id in path_ids:
-            row = self.id_to_row[cube_id]
-            path.append([
-                int(row[0]),
-                float(row[1]),
-                float(row[2]),
-                float(row[3]),
-                float(row[4]),
-            ])
+        while current in came_from:
+            current = came_from[current]
+            path.append(current)
 
-        return path
+        path.reverse()
+
+        return [self._to_index(flat) for flat in path]
+
+    def _segment_allowed(self, a: GridIndex, b: GridIndex, max_cost_factor: float) -> bool:
+        """
+        Straight segment from a to b is allowed if it touches no occupied voxel
+        and no voxel more expensive than max_cost_factor.
+        """
+        a = np.asarray(a, dtype=np.float64)
+        b = np.asarray(b, dtype=np.float64)
+
+        samples = int(math.ceil(np.abs(b - a).max() * 4.0)) + 1
+        t = np.linspace(0.0, 1.0, samples).reshape(-1, 1)
+        points = a + t * (b - a)
+
+        tube = (points[:, None, :] + _TUBE_OFFSETS[None, :, :]).reshape(-1, 3)
+        indices = np.unique(np.rint(tube).astype(np.int64), axis=0)
+        indices = np.clip(indices, 0, np.asarray(self.shape) - 1)
+        indices = tuple(indices.T)
+
+        if self.occupancy[indices].any():
+            return False
+
+        if max_cost_factor < self.clearance_cost and self.clearance_zone[indices].any():
+            return False
+
+        return True
+
+    def simplify(self, path: List[GridIndex]) -> List[GridIndex]:
+        """
+        Reduce the path to the voxels where it changes direction.
+
+        A section of the path is replaced by a straight segment only if the
+        segment stays clear of obstacles and does not enter the clearance zone
+        when the original section avoided it.
+        """
+        if len(path) <= 2:
+            return list(path)
+
+        cost_factors = [self.cost_factor(index) for index in path]
+        simplified = [path[0]]
+        i = 0
+
+        while i < len(path) - 1:
+            j = len(path) - 1
+
+            while j > i + 1 and not self._segment_allowed(
+                    path[i], path[j], max(cost_factors[i:j + 1])):
+                j -= 1
+
+            simplified.append(path[j])
+            i = j
+
+        return simplified

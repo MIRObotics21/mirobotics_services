@@ -175,3 +175,38 @@ def occupancy_to_matrix(
     passable = np.where(occupancy.ravel(), 0.0, 1.0).reshape(-1, 1)
 
     return np.hstack((cube_ids, centers, passable))
+
+
+def point_to_grid_index(
+        point: Sequence[float],
+        min_index: np.ndarray,
+        voxel_size: float,
+) -> Tuple[int, int, int]:
+    """Grid index of the voxel containing the point, may lie outside the grid."""
+    index = np.floor(np.asarray(point, dtype=np.float64) / voxel_size).astype(np.int64) - min_index
+    return int(index[0]), int(index[1]), int(index[2])
+
+
+def grid_index_to_center(
+        index: Sequence[int],
+        min_index: np.ndarray,
+        voxel_size: float,
+) -> Tuple[float, float, float]:
+    center = (np.asarray(index) + np.asarray(min_index) + 0.5) * voxel_size
+    return float(center[0]), float(center[1]), float(center[2])
+
+
+def grid_index_to_id(index: Sequence[int], shape: Tuple[int, int, int]) -> int:
+    return (int(index[0]) * shape[1] + int(index[1])) * shape[2] + int(index[2])
+
+
+def id_to_grid_index(voxel_id: int, shape: Tuple[int, int, int]) -> Tuple[int, int, int]:
+    if voxel_id < 0 or voxel_id >= shape[0] * shape[1] * shape[2]:
+        raise ValueError(
+            f'Voxel id {voxel_id} is outside the grid, valid ids are '
+            f'0 -> {shape[0] * shape[1] * shape[2] - 1}.'
+        )
+
+    rest, iz = divmod(int(voxel_id), shape[2])
+    ix, iy = divmod(rest, shape[1])
+    return ix, iy, iz
