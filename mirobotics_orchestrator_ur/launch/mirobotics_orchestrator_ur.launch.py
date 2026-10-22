@@ -48,6 +48,7 @@ def generate_launch_description():
             'camera_info_topic': camera_info_topic,
             'ray_max_distance': 3.0,
             'service_timeout': 30.0,
+            'publish_markers': True,
         }]
     )
 

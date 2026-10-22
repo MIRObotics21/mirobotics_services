@@ -8,8 +8,9 @@ from rclpy.action import ActionServer, ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
-from geometry_msgs.msg import PointStamped,Pose
+from geometry_msgs.msg import Point, PointStamped, Pose
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import (
     Constraints,
@@ -20,6 +21,7 @@ from moveit_msgs.msg import (
 from shape_msgs.msg import SolidPrimitive
 
 from sensor_msgs.msg import CameraInfo
+from visualization_msgs.msg import Marker, MarkerArray
 from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
 
 from mirobotics_msg.action import GenerateScene, PlanAndExecute
@@ -31,6 +33,16 @@ BASE_FRAME = 'base_link'
 SCENE_EVAL_SERVICE = '/mirobotics_scene_eval/mirobotics_eval_scene'
 CAPTURE_SCENE_SERVICE = '/capture_scene'
 PLAN_PATH_SERVICE = '/plan_path'
+
+# Marker colors per object type, assigned in order of first appearance
+OBJECT_COLORS = [
+    (0.9, 0.2, 0.2),
+    (0.2, 0.4, 1.0),
+    (0.2, 0.8, 0.2),
+    (1.0, 0.8, 0.1),
+    (0.8, 0.3, 0.9),
+    (0.1, 0.8, 0.8),
+]
 
 MOVE_GROUP_ACTION = '/move_action'
 MOVE_GROUP_NAME = 'ur_manipulator'
@@ -56,6 +68,8 @@ class OrchestratorURServer(Node):
         self.declare_parameter('ray_max_distance', 3.0)
         # Maximum time to wait for a response of EvalScene, CaptureScene and PlanPath, in seconds.
         self.declare_parameter('service_timeout', 30.0)
+        # Publish object, hit point and approach voxels for RViz after each GenerateScene.
+        self.declare_parameter('publish_markers', True)
 
         self.camera_info_received = False
         self.fx = None
@@ -98,6 +112,20 @@ class OrchestratorURServer(Node):
             PlanPath,
             PLAN_PATH_SERVICE,
             callback_group=self.client_callback_group
+        )
+
+        # Latched, RViz receives the last scene even when started later.
+        marker_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+
+        self.object_marker_pub = self.create_publisher(
+            MarkerArray,
+            'scene_object_markers',
+            marker_qos
         )
 
         self.action_server = ActionServer(
@@ -240,6 +268,87 @@ class OrchestratorURServer(Node):
         )
 
         return camera_origin, rotation_target_camera
+
+    def publish_object_markers(self, objects_3d, voxel_size, frame_id):
+        """
+        Per detected object:
+            object voxel   - cube in the object type color
+            hit point      - small white sphere where the ray enters the object voxel
+            approach voxel - green transparent cube
+            label          - "id type confidence" above the object
+        Markers of the previous GenerateScene are deleted first.
+        """
+        markers = []
+
+        clear = Marker()
+        clear.header.frame_id = frame_id
+        clear.action = Marker.DELETEALL
+        markers.append(clear)
+
+        type_colors = {}
+
+        def new_marker(ns, marker_id, marker_type, position, scale, color, alpha):
+            marker = Marker()
+            marker.header.frame_id = frame_id
+            marker.ns = ns
+            marker.id = marker_id
+            marker.type = marker_type
+            marker.action = Marker.ADD
+            marker.pose.position = Point(
+                x=float(position[0]), y=float(position[1]), z=float(position[2])
+            )
+            marker.pose.orientation.w = 1.0
+            marker.scale.x = scale
+            marker.scale.y = scale
+            marker.scale.z = scale
+            marker.color.r, marker.color.g, marker.color.b = color
+            marker.color.a = alpha
+            return marker
+
+        for marker_id, obj in enumerate(objects_3d):
+            object_type = str(obj.get('type'))
+
+            if object_type not in type_colors:
+                type_colors[object_type] = OBJECT_COLORS[len(type_colors) % len(OBJECT_COLORS)]
+
+            color = type_colors[object_type]
+
+            if obj.get('object_point') is not None:
+                markers.append(new_marker(
+                    'object_voxels', marker_id, Marker.CUBE,
+                    obj['object_point'], voxel_size, color, 0.8
+                ))
+
+            if obj.get('hit_point') is not None:
+                markers.append(new_marker(
+                    'hit_points', marker_id, Marker.SPHERE,
+                    obj['hit_point'], max(voxel_size * 0.3, 0.008), (1.0, 1.0, 1.0), 1.0
+                ))
+
+            if obj.get('approach_point') is not None:
+                markers.append(new_marker(
+                    'approach_voxels', marker_id, Marker.CUBE,
+                    obj['approach_point'], voxel_size, (0.2, 1.0, 0.2), 0.35
+                ))
+
+            label_anchor = obj.get('approach_point') or obj.get('object_point')
+
+            if label_anchor is not None:
+                confidence = obj.get('confidence')
+                text = f'{obj.get("id")} {object_type}'
+
+                if confidence is not None:
+                    text += f' {float(confidence):.2f}'
+
+                label = new_marker(
+                    'labels', marker_id, Marker.TEXT_VIEW_FACING,
+                    [label_anchor[0], label_anchor[1], label_anchor[2] + voxel_size],
+                    max(voxel_size, 0.03), (1.0, 1.0, 1.0), 1.0
+                )
+                label.text = text
+                markers.append(label)
+
+        self.object_marker_pub.publish(MarkerArray(markers=markers))
 
     def abort_generate_scene(self, goal_handle, error_msg, json_matrix=''):
         self.get_logger().error(f'GenerateScene failed: {error_msg}')
@@ -386,6 +495,16 @@ class OrchestratorURServer(Node):
         self.get_logger().info(
             f'Objects 3D: {json_objects_3d}'
         )
+
+        if self.get_parameter('publish_markers').value:
+            try:
+                self.publish_object_markers(
+                    json.loads(json_objects_3d),
+                    scene.voxel_size,
+                    grid_frame
+                )
+            except Exception as exc:
+                self.get_logger().warning(f'Failed to publish object markers: {exc}')
 
         result = GenerateScene.Result()
         result.success = True

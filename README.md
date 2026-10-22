@@ -323,6 +323,20 @@ The `GenerateScene` action performs:
 | `camera_info_topic` | `/camera/camera/color/camera_info` | CameraInfo of the RGB image used by EvalScene. |
 | `ray_max_distance` | `3.0` | Maximum distance from the camera searched for an object, in meters. |
 | `service_timeout` | `30.0` | Maximum time to wait for an EvalScene, CaptureScene or PlanPath response, in seconds. |
+| `publish_markers` | `true` | Publishes the localized objects for RViz after each GenerateScene. |
+
+### Visualization
+
+After each GenerateScene the localized objects are published on `scene_object_markers`
+(`visualization_msgs/MarkerArray`, Durability Policy `Transient Local` in RViz).
+Markers of the previous call are deleted first.
+
+| Namespace | Marker | Meaning |
+|---|---|---|
+| `object_voxels` | solid cube | Object voxel. Color per object type, assigned in order of first appearance. |
+| `hit_points` | small white sphere | Exact point where the ray enters the object voxel. |
+| `approach_voxels` | transparent green cube | Approach voxel, the first free voxel above the object. |
+| `labels` | text | `id type confidence` above the object. |
 
 ### Usage
 
