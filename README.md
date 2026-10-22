@@ -311,10 +311,18 @@ pointcloud2_publisher:=/camera/camera/depth/color/points
 
 The `GenerateScene` action performs:
 
-1. YOLO scene evaluation
-2. point cloud voxelization
-3. ray projection
-4. object assignment into voxel matrix
+1. YOLO scene evaluation (EvalScene)
+2. point cloud voxelization (CaptureScene)
+3. TF lookup of the camera in the frame of the voxel grid
+4. ray projection and object assignment into the voxel grid
+
+### Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `camera_info_topic` | `/camera/camera/color/camera_info` | CameraInfo of the RGB image used by EvalScene. |
+| `ray_max_distance` | `3.0` | Maximum distance from the camera searched for an object, in meters. |
+| `service_timeout` | `30.0` | Maximum time to wait for an EvalScene, CaptureScene or PlanPath response, in seconds. |
 
 ### Usage
 
@@ -323,7 +331,7 @@ ros2 action send_goal \
 /generate_scene \
 mirobotics_msg/action/GenerateScene \
 "{model_path: '/home/mirobotics/models/best.onnx',
-voxel_size: 1}" --feedback
+voxel_size: 0.02}" --feedback
 ```
 
 ### Example Output
@@ -337,17 +345,23 @@ json_objects_3d:
  {
   "id":1,
   "type":"zelena",
-  "object_voxel_id":13,
-  "approach_voxel_id":null
- },
- {
-  "id":2,
-  "type":"modra",
-  "object_voxel_id":13,
-  "approach_voxel_id":null
+  "confidence":0.91,
+  "object_voxel_id":58781,
+  "object_point":[0.21,0.13,0.09],
+  "hit_point":[0.2034,0.1281,0.1],
+  "approach_voxel_id":58782,
+  "approach_point":[0.21,0.13,0.11]
  }
 ]
 ```
+
+* `object_voxel_id`, `object_point`: first occupied voxel hit by the ray and its center
+* `hit_point`: exact point where the ray enters that voxel
+* `approach_voxel_id`, `approach_point`: first free voxel above the object voxel
+
+All points are in the frame of the voxel grid (`planning_frame` of the path planner).
+Values are `null` when the ray hits nothing or the column above the object is occupied
+up to the top of the workspace box. `approach_point` can be passed directly as `goal_point` to PlanPath.
 
 ---
 
@@ -389,9 +403,10 @@ The framework uses ray projection to localize detected objects inside the voxeli
 The algorithm:
 
 1. converts image coordinates `(u,v)` into camera rays
-2. transforms rays into robot base coordinates using TF
-3. traverses the voxel matrix
+2. transforms rays into the frame of the voxel grid using TF
+3. traverses the voxel grid voxel by voxel (Amanatides & Woo), so no voxel is skipped regardless of its size
 4. assigns the first occupied voxel intersected by the ray
+5. searches upwards from that voxel for the first free voxel, the approach voxel
 
 This allows reliable 3D object localization without explicit depth segmentation.
 

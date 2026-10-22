@@ -46,6 +46,8 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'camera_info_topic': camera_info_topic,
+            'ray_max_distance': 3.0,
+            'service_timeout': 30.0,
         }]
     )
 

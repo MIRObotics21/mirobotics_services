@@ -1,19 +1,40 @@
 import json
 import math
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
 
 
-Voxel = Dict[str, float]
-Detection = Dict[str, float]
+GridIndex = Tuple[int, int, int]
 
 
-def normalize_vector(vector: List[float]) -> List[float]:
-    norm = math.sqrt(sum(v * v for v in vector))
+@dataclass
+class SceneGrid:
+    """Voxel grid parsed from the CaptureScene json_matrix."""
+
+    voxel_size: float
+    min_index: np.ndarray
+    shape: Tuple[int, int, int]
+    frame_id: str
+    occupancy: np.ndarray
+
+    def voxel_id(self, index: Sequence[int]) -> int:
+        return (int(index[0]) * self.shape[1] + int(index[1])) * self.shape[2] + int(index[2])
+
+    def center(self, index: Sequence[int]) -> List[float]:
+        center = (np.asarray(index) + self.min_index + 0.5) * self.voxel_size
+        return [round(float(c), 4) for c in center]
+
+
+def normalize_vector(vector: Sequence[float]) -> np.ndarray:
+    vector = np.asarray(vector, dtype=np.float64)
+    norm = np.linalg.norm(vector)
 
     if norm == 0.0:
         raise ValueError('Cannot normalize zero-length vector')
 
-    return [v / norm for v in vector]
+    return vector / norm
 
 
 def pixel_to_camera_ray(
@@ -23,7 +44,7 @@ def pixel_to_camera_ray(
     fy: float,
     cx: float,
     cy: float
-) -> List[float]:
+) -> np.ndarray:
     """
     Converts RGB pixel coordinate into a ray in camera optical frame.
 
@@ -40,38 +61,50 @@ def pixel_to_camera_ray(
     return normalize_vector([x, y, z])
 
 
-def parse_voxel_matrix(json_matrix: str) -> Tuple[float, List[Voxel]]:
+def parse_scene_grid(json_matrix: str) -> SceneGrid:
     """
-    Expected format:
+    Expected format (CaptureScene of mirobotics_path_planner):
     {
         "voxel_size": 0.1,
+        "grid": {"min_index": [...], "shape": [nx, ny, nz], "origin": [...], "frame_id": "base_link"},
         "matrix": [
             [id, x, y, z, passable],
             ...
         ]
     }
+    Rows are ordered by id = (ix * ny + iy) * nz + iz.
     """
 
     data = json.loads(json_matrix)
 
-    voxel_size = float(data.get('voxel_size', 0.1))
-    raw_matrix = data.get('matrix', [])
+    if not isinstance(data, dict) or 'matrix' not in data:
+        raise ValueError('json_matrix must be a JSON object with key "matrix"')
 
-    voxels = []
+    grid = data.get('grid')
 
-    for row in raw_matrix:
-        if len(row) < 5:
-            continue
+    if grid is None:
+        raise ValueError(
+            'json_matrix has no "grid" description, '
+            'CaptureScene of the current mirobotics_path_planner is required'
+        )
 
-        voxels.append({
-            'id': int(row[0]),
-            'x': float(row[1]),
-            'y': float(row[2]),
-            'z': float(row[3]),
-            'passable': float(row[4]),
-        })
+    voxel_size = float(data['voxel_size'])
+    shape = tuple(int(n) for n in grid['shape'])
+    matrix = np.asarray(data['matrix'], dtype=np.float64)
 
-    return voxel_size, voxels
+    if matrix.shape != (shape[0] * shape[1] * shape[2], 5):
+        raise ValueError(
+            f'json_matrix has {matrix.shape[0]} rows, grid shape {list(shape)} '
+            f'requires {shape[0] * shape[1] * shape[2]}'
+        )
+
+    return SceneGrid(
+        voxel_size=voxel_size,
+        min_index=np.asarray(grid['min_index'], dtype=np.int64),
+        shape=shape,
+        frame_id=str(grid.get('frame_id', '')),
+        occupancy=(matrix[:, 4] < 0.5).reshape(shape),
+    )
 
 
 def parse_scene_objects(json_objects: str) -> List[Dict]:
@@ -96,189 +129,176 @@ def parse_scene_objects(json_objects: str) -> List[Dict]:
     return data
 
 
-def find_first_hit_voxel(
-    camera_origin_base: List[float],
-    ray_direction_base: List[float],
-    voxels: List[Voxel],
-    voxel_size: float,
-    ray_step: float,
-    ray_max_distance: float,
-    occupied_passable_value: float = 0.0
-) -> Optional[Voxel]:
+def cast_ray(
+    scene: SceneGrid,
+    origin: Sequence[float],
+    direction: Sequence[float],
+    max_distance: float,
+) -> Optional[Tuple[GridIndex, float]]:
     """
-    Simple ray marching.
+    Voxel traversal (Amanatides & Woo) along the ray until the first occupied voxel.
 
-    At each ray point, find voxel whose center is closest and within half voxel size.
-    The first voxel with passable == occupied_passable_value is returned.
+    The origin may lie outside the grid, the ray is first clipped to the grid box.
+    Every voxel the ray passes through is visited exactly once, so no voxel is
+    skipped regardless of its size.
+
+    Returns:
+        index of the first occupied voxel and the distance from origin to the
+        point where the ray enters it, or None when nothing is hit within
+        max_distance
     """
 
-    half_voxel = voxel_size / 2.0
+    origin = np.asarray(origin, dtype=np.float64)
+    direction = normalize_vector(direction)
+    voxel_size = scene.voxel_size
+    shape = np.asarray(scene.shape)
 
-    occupied_voxels = [
-        voxel for voxel in voxels
-        if voxel['passable'] == occupied_passable_value
-    ]
+    lower = scene.min_index * voxel_size
+    upper = (scene.min_index + shape) * voxel_size
 
-    if not occupied_voxels:
+    # Clip the ray to the grid box (slab method)
+    t_enter = 0.0
+    t_exit = float(max_distance)
+
+    for axis in range(3):
+        if abs(direction[axis]) < 1e-12:
+            if origin[axis] < lower[axis] or origin[axis] > upper[axis]:
+                return None
+            continue
+
+        t1 = (lower[axis] - origin[axis]) / direction[axis]
+        t2 = (upper[axis] - origin[axis]) / direction[axis]
+        t_enter = max(t_enter, min(t1, t2))
+        t_exit = min(t_exit, max(t1, t2))
+
+    if t_enter > t_exit:
         return None
 
-    distance = 0.0
+    entry = origin + direction * t_enter
+    index = np.floor(entry / voxel_size).astype(np.int64) - scene.min_index
+    index = np.clip(index, 0, shape - 1)
 
-    while distance <= ray_max_distance:
-        px = camera_origin_base[0] + distance * ray_direction_base[0]
-        py = camera_origin_base[1] + distance * ray_direction_base[1]
-        pz = camera_origin_base[2] + distance * ray_direction_base[2]
+    step = np.zeros(3, dtype=np.int64)
+    t_max = np.full(3, math.inf)
+    t_delta = np.full(3, math.inf)
 
-        for voxel in occupied_voxels:
-            if (
-                abs(px - voxel['x']) <= half_voxel and
-                abs(py - voxel['y']) <= half_voxel and
-                abs(pz - voxel['z']) <= half_voxel
-            ):
-                return voxel
+    for axis in range(3):
+        if direction[axis] > 1e-12:
+            step[axis] = 1
+            boundary = (scene.min_index[axis] + index[axis] + 1) * voxel_size
+        elif direction[axis] < -1e-12:
+            step[axis] = -1
+            boundary = (scene.min_index[axis] + index[axis]) * voxel_size
+        else:
+            continue
 
-        distance += ray_step
+        t_max[axis] = (boundary - origin[axis]) / direction[axis]
+        t_delta[axis] = voxel_size / abs(direction[axis])
 
-    return None
+    t = t_enter
+
+    while True:
+        if scene.occupancy[tuple(index)]:
+            return (int(index[0]), int(index[1]), int(index[2])), float(t)
+
+        axis = int(np.argmin(t_max))
+        t = float(t_max[axis])
+
+        if t > t_exit:
+            return None
+
+        index[axis] += step[axis]
+
+        if index[axis] < 0 or index[axis] >= shape[axis]:
+            return None
+
+        t_max[axis] += t_delta[axis]
+
+
+def find_approach_voxel(scene: SceneGrid, hit_index: Sequence[int]) -> Optional[GridIndex]:
+    """
+    First free voxel above the hit voxel in the same column.
+    Returns None when the column is occupied up to the top of the grid.
+    """
+
+    ix, iy, iz = (int(i) for i in hit_index)
+    free = np.flatnonzero(~scene.occupancy[ix, iy, iz + 1:])
+
+    if free.size == 0:
+        return None
+
+    return ix, iy, iz + 1 + int(free[0])
 
 
 def assign_objects_to_voxels(
     json_objects: str,
-    json_matrix: str,
-    camera_origin_base: List[float],
-    rotation_base_camera: List[List[float]],
+    scene: SceneGrid,
+    camera_origin: Sequence[float],
+    rotation_frame_camera: Sequence[Sequence[float]],
     fx: float,
     fy: float,
     cx: float,
     cy: float,
-    ray_step: float = 0.02,
     ray_max_distance: float = 3.0,
-    occupied_passable_value: float = 0.0
 ) -> str:
     """
     Assigns SceneEval 2D detections to occupied voxels.
 
-    rotation_base_camera is a 3x3 rotation matrix that transforms vectors from
-    camera optical frame into base_link frame.
+    scene is the voxel grid from parse_scene_grid. camera_origin and
+    rotation_frame_camera describe the camera optical frame in the frame of
+    the voxel grid (scene.frame_id). The rotation matrix
+    transforms vectors from camera optical frame into that frame.
+
+    For every detection the ray through its pixel is traced through the grid.
+    The first occupied voxel is the object voxel, the first free voxel above
+    it is the approach voxel. Missing voxels are reported as None.
     """
 
-    voxel_size, voxels = parse_voxel_matrix(json_matrix)
     detections = parse_scene_objects(json_objects)
+    rotation = np.asarray(rotation_frame_camera, dtype=np.float64)
+    origin = np.asarray(camera_origin, dtype=np.float64)
 
-    assigned_voxel_ids = []
     objects_3d = []
 
     for detection in detections:
-        u = float(detection['u'])
-        v = float(detection['v'])
-
         ray_camera = pixel_to_camera_ray(
-            u=u,
-            v=v,
+            u=float(detection['u']),
+            v=float(detection['v']),
             fx=fx,
             fy=fy,
             cx=cx,
             cy=cy
         )
 
-        ray_base = [
-            rotation_base_camera[0][0] * ray_camera[0] +
-            rotation_base_camera[0][1] * ray_camera[1] +
-            rotation_base_camera[0][2] * ray_camera[2],
-
-            rotation_base_camera[1][0] * ray_camera[0] +
-            rotation_base_camera[1][1] * ray_camera[1] +
-            rotation_base_camera[1][2] * ray_camera[2],
-
-            rotation_base_camera[2][0] * ray_camera[0] +
-            rotation_base_camera[2][1] * ray_camera[1] +
-            rotation_base_camera[2][2] * ray_camera[2],
-        ]
-
-        ray_base = normalize_vector(ray_base)
-
-        hit_voxel = find_first_hit_voxel(
-            camera_origin_base=camera_origin_base,
-            ray_direction_base=ray_base,
-            voxels=voxels,
-            voxel_size=voxel_size,
-            ray_step=ray_step,
-            ray_max_distance=ray_max_distance,
-            occupied_passable_value=occupied_passable_value
-        )
-
-        approach_voxel = None
-
-        if hit_voxel is not None:
-            approach_voxel = find_voxel_above(
-                hit_voxel=hit_voxel,
-                voxels=voxels,
-                voxel_size=voxel_size,
-                z_steps=1
-            )
+        ray_frame = rotation @ ray_camera
 
         output_object = {
             'id': detection.get('id'),
             'type': detection.get('type'),
+            'confidence': detection.get('confidence'),
             'object_voxel_id': None,
+            'object_point': None,
+            'hit_point': None,
             'approach_voxel_id': None,
+            'approach_point': None,
         }
 
-        if hit_voxel is not None:
-            output_object['object_voxel_id'] = hit_voxel['id']
+        hit = cast_ray(scene, origin, ray_frame, ray_max_distance)
 
-        if approach_voxel is not None:
-            output_object['approach_voxel_id'] = approach_voxel['id']
+        if hit is not None:
+            hit_index, hit_distance = hit
+            hit_point = origin + normalize_vector(ray_frame) * hit_distance
+
+            output_object['object_voxel_id'] = scene.voxel_id(hit_index)
+            output_object['object_point'] = scene.center(hit_index)
+            output_object['hit_point'] = [round(float(c), 4) for c in hit_point]
+
+            approach_index = find_approach_voxel(scene, hit_index)
+
+            if approach_index is not None:
+                output_object['approach_voxel_id'] = scene.voxel_id(approach_index)
+                output_object['approach_point'] = scene.center(approach_index)
 
         objects_3d.append(output_object)
 
-    updated_json_matrix = set_voxel_passable(
-        json_matrix=json_matrix,
-        voxel_ids_to_update=assigned_voxel_ids,
-        new_passable_value=1.0
-    )
-
-    return json.dumps(objects_3d), updated_json_matrix
-
-def set_voxel_passable(
-    json_matrix: str,
-    voxel_ids_to_update: List[int],
-    new_passable_value: float = 0.0 #remove in future pls - used different method
-) -> str:
-    """
-    Updates passable value of selected voxels inside json_matrix.
-    """
-
-    data = json.loads(json_matrix)
-
-    matrix = data.get('matrix', [])
-
-    voxel_ids_set = set(voxel_ids_to_update)
-
-    for row in matrix:
-        if len(row) < 5:
-            continue
-
-        voxel_id = int(row[0])
-
-        if voxel_id in voxel_ids_set:
-            row[4] = float(new_passable_value)
-
-    return json.dumps(data)
-
-def find_voxel_above(hit_voxel, voxels, voxel_size, z_steps=1):
-    target_x = hit_voxel['x']
-    target_y = hit_voxel['y']
-    target_z = hit_voxel['z'] + voxel_size * z_steps
-
-    tolerance = voxel_size * 0.25
-
-    for voxel in voxels:
-        if (
-            abs(voxel['x'] - target_x) <= tolerance and
-            abs(voxel['y'] - target_y) <= tolerance and
-            abs(voxel['z'] - target_z) <= tolerance
-        ):
-            return voxel
-
-    return None
+    return json.dumps(objects_3d)

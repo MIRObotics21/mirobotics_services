@@ -1,10 +1,13 @@
 import math
 import json
+import threading
 
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionServer, ActionClient
+from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
+from rclpy.executors import MultiThreadedExecutor
 
 from geometry_msgs.msg import PointStamped,Pose
 from moveit_msgs.action import MoveGroup
@@ -22,15 +25,12 @@ from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityExce
 from mirobotics_msg.action import GenerateScene, PlanAndExecute
 from mirobotics_msg.srv import EvalScene, CaptureScene, PlanPath
 
-from mirobotics_orchestrator_ur.ray_casting import assign_objects_to_voxels
+from mirobotics_orchestrator_ur.ray_casting import assign_objects_to_voxels, parse_scene_grid
 
 BASE_FRAME = 'base_link'
 SCENE_EVAL_SERVICE = '/mirobotics_scene_eval/mirobotics_eval_scene'
 CAPTURE_SCENE_SERVICE = '/capture_scene'
 PLAN_PATH_SERVICE = '/plan_path'
-RAY_STEP = 0.02
-RAY_MAX_DISTANCE = 3.0
-OCCUPIED_PASSABLE_VALUE = 0.0
 
 MOVE_GROUP_ACTION = '/move_action'
 MOVE_GROUP_NAME = 'ur_manipulator'
@@ -51,6 +51,11 @@ class OrchestratorURServer(Node):
         self.camera_info_topic = self.get_parameter(
             'camera_info_topic'
         ).get_parameter_value().string_value
+
+        # Maximum distance from the camera searched for an object, in meters.
+        self.declare_parameter('ray_max_distance', 3.0)
+        # Maximum time to wait for a response of EvalScene, CaptureScene and PlanPath, in seconds.
+        self.declare_parameter('service_timeout', 30.0)
 
         self.camera_info_received = False
         self.fx = None
@@ -74,19 +79,25 @@ class OrchestratorURServer(Node):
             10
         )
 
+        # Responses are handled by another executor thread while an action waits for them.
+        self.client_callback_group = ReentrantCallbackGroup()
+
         self.eval_scene_client = self.create_client(
             EvalScene,
-            SCENE_EVAL_SERVICE
+            SCENE_EVAL_SERVICE,
+            callback_group=self.client_callback_group
         )
 
         self.capture_scene_client = self.create_client(
             CaptureScene,
-            CAPTURE_SCENE_SERVICE
+            CAPTURE_SCENE_SERVICE,
+            callback_group=self.client_callback_group
         )
 
         self.plan_path_client = self.create_client(
             PlanPath,
-            PLAN_PATH_SERVICE
+            PLAN_PATH_SERVICE,
+            callback_group=self.client_callback_group
         )
 
         self.action_server = ActionServer(
@@ -118,9 +129,7 @@ class OrchestratorURServer(Node):
         )
 
     def camera_info_callback(self, msg: CameraInfo):
-        if self.camera_info_received:
-            return
-
+        # Keep the latest intrinsics, they change when the camera resolution changes
         self.camera_info_received = True
 
         self.fx = msg.k[0]
@@ -177,18 +186,38 @@ class OrchestratorURServer(Node):
             ],
         ]
 
-    def get_camera_transform_to_base(self):
+    def call_service(self, client, request, timeout_sec):
+        """
+        Call a service and block until the response arrives or timeout_sec passes.
+
+        The response is received by another executor thread, so this must not be
+        called from a callback in client_callback_group.
+        """
+        done = threading.Event()
+        future = client.call_async(request)
+        future.add_done_callback(lambda _: done.set())
+
+        if not done.wait(timeout_sec):
+            try:
+                client.remove_pending_request(future)
+            except AttributeError:
+                pass
+            raise TimeoutError(f'No response from {client.srv_name} within {timeout_sec:.1f} s')
+
+        return future.result()
+
+    def get_camera_transform(self, target_frame):
         """
         Returns:
-            camera_origin_base: [x, y, z]
-            rotation_base_camera: 3x3 rotation matrix
+            camera_origin: [x, y, z] of the camera optical frame in target_frame
+            rotation_target_camera: 3x3 rotation matrix camera -> target_frame
         """
 
         if self.camera_frame is None:
             raise RuntimeError('Camera frame is unknown because CameraInfo was not received')
 
         transform = self.tf_buffer.lookup_transform(
-            BASE_FRAME,
+            target_frame,
             self.camera_frame,
             rclpy.time.Time(),
             timeout=Duration(seconds=2.0)
@@ -197,74 +226,59 @@ class OrchestratorURServer(Node):
         translation = transform.transform.translation
         rotation = transform.transform.rotation
 
-        camera_origin_base = [
+        camera_origin = [
             translation.x,
             translation.y,
             translation.z,
         ]
 
-        rotation_base_camera = self.quaternion_to_rotation_matrix(
+        rotation_target_camera = self.quaternion_to_rotation_matrix(
             rotation.x,
             rotation.y,
             rotation.z,
             rotation.w
         )
 
-        return camera_origin_base, rotation_base_camera
+        return camera_origin, rotation_target_camera
 
-    async def execute_generate_scene_callback(self, goal_handle):
+    def abort_generate_scene(self, goal_handle, error_msg, json_matrix=''):
+        self.get_logger().error(f'GenerateScene failed: {error_msg}')
+
+        result = GenerateScene.Result()
+        result.success = False
+        result.error_msg = error_msg
+        result.json_matrix = json_matrix
+        result.json_objects_3d = '[]'
+
+        goal_handle.abort()
+        return result
+
+    def execute_generate_scene_callback(self, goal_handle):
         self.get_logger().info('GenerateScene action goal received')
 
         goal = goal_handle.request
-        result = GenerateScene.Result()
+        service_timeout = float(self.get_parameter('service_timeout').value)
 
         self.get_logger().info(
             f'Goal model_path="{goal.model_path}", voxel_size={goal.voxel_size}'
         )
 
         if not self.camera_info_received:
-            result.success = False
-            result.error_msg = (
+            return self.abort_generate_scene(
+                goal_handle,
                 f'No CameraInfo received from topic: {self.camera_info_topic}'
             )
-            result.json_matrix = ''
-            result.json_objects_3d = '[]'
-            goal_handle.abort()
-            return result
 
-        self.publish_feedback(goal_handle, 'waiting_for_tf', 0.05)
-
-        try:
-            camera_origin_base, rotation_base_camera = self.get_camera_transform_to_base()
-        except (
-            LookupException,
-            ConnectivityException,
-            ExtrapolationException,
-            RuntimeError,
-            ValueError
-        ) as exc:
-            result.success = False
-            result.error_msg = (
-                f'Could not get TF {BASE_FRAME} <- {self.camera_frame}: {str(exc)}'
-            )
-            result.json_matrix = ''
-            result.json_objects_3d = '[]'
-            goal_handle.abort()
-            return result
-
-        self.get_logger().info(
-            f'Camera origin in {BASE_FRAME}: {camera_origin_base}'
-        )
+        # Intrinsics of the image that is evaluated
+        fx, fy, cx, cy = self.fx, self.fy, self.cx, self.cy
 
         self.publish_feedback(goal_handle, 'waiting_for_eval_scene_service', 0.10)
 
         if not self.eval_scene_client.wait_for_service(timeout_sec=5.0):
-            result.success = False
-            result.error_msg = f'EvalScene service not available: {SCENE_EVAL_SERVICE}'
-            result.json_matrix = ''
-            result.json_objects_3d = '[]'
-            goal_handle.abort()
-            return result
+            return self.abort_generate_scene(
+                goal_handle,
+                f'EvalScene service not available: {SCENE_EVAL_SERVICE}'
+            )
 
         self.publish_feedback(goal_handle, 'calling_eval_scene', 0.25)
 
@@ -272,16 +286,16 @@ class OrchestratorURServer(Node):
         eval_request.model_path = goal.model_path
         eval_request.annotated_image_path = ''
 
-        eval_future = self.eval_scene_client.call_async(eval_request)
-        eval_response = await eval_future
+        try:
+            eval_response = self.call_service(self.eval_scene_client, eval_request, service_timeout)
+        except TimeoutError as exc:
+            return self.abort_generate_scene(goal_handle, f'EvalScene failed: {exc}')
 
         if not eval_response.success:
-            result.success = False
-            result.error_msg = f'EvalScene failed: {eval_response.error_msg}'
-            result.json_matrix = ''
-            result.json_objects_3d = '[]'
-            goal_handle.abort()
-            return result
+            return self.abort_generate_scene(
+                goal_handle,
+                f'EvalScene failed: {eval_response.error_msg}'
+            )
 
         self.get_logger().info(
             f'EvalScene objects: {eval_response.json_objects}'
@@ -290,66 +304,96 @@ class OrchestratorURServer(Node):
         self.publish_feedback(goal_handle, 'waiting_for_capture_scene_service', 0.45)
 
         if not self.capture_scene_client.wait_for_service(timeout_sec=5.0):
-            result.success = False
-            result.error_msg = f'CaptureScene service not available: {CAPTURE_SCENE_SERVICE}'
-            result.json_matrix = ''
-            result.json_objects_3d = '[]'
-            goal_handle.abort()
-            return result
+            return self.abort_generate_scene(
+                goal_handle,
+                f'CaptureScene service not available: {CAPTURE_SCENE_SERVICE}'
+            )
 
         self.publish_feedback(goal_handle, 'calling_capture_scene', 0.60)
 
         capture_request = CaptureScene.Request()
         capture_request.voxel_size = goal.voxel_size
 
-        capture_future = self.capture_scene_client.call_async(capture_request)
-        capture_response = await capture_future
+        try:
+            capture_response = self.call_service(
+                self.capture_scene_client, capture_request, service_timeout
+            )
+        except TimeoutError as exc:
+            return self.abort_generate_scene(goal_handle, f'CaptureScene failed: {exc}')
 
         if not capture_response.success:
-            result.success = False
-            result.error_msg = f'CaptureScene failed: {capture_response.error_msg}'
-            result.json_matrix = ''
-            result.json_objects_3d = '[]'
-            goal_handle.abort()
-            return result
+            return self.abort_generate_scene(
+                goal_handle,
+                f'CaptureScene failed: {capture_response.error_msg}'
+            )
 
         self.get_logger().info('CaptureScene returned voxel matrix')
+
+        try:
+            scene = parse_scene_grid(capture_response.json_matrix)
+        except (ValueError, KeyError) as exc:
+            return self.abort_generate_scene(
+                goal_handle,
+                f'Invalid CaptureScene json_matrix: {exc}',
+                capture_response.json_matrix
+            )
+
+        grid_frame = scene.frame_id or BASE_FRAME
+
+        self.publish_feedback(goal_handle, 'waiting_for_tf', 0.70)
+
+        try:
+            camera_origin, rotation_frame_camera = self.get_camera_transform(grid_frame)
+        except (
+            LookupException,
+            ConnectivityException,
+            ExtrapolationException,
+            RuntimeError,
+            ValueError
+        ) as exc:
+            return self.abort_generate_scene(
+                goal_handle,
+                f'Could not get TF {grid_frame} <- {self.camera_frame}: {str(exc)}',
+                capture_response.json_matrix
+            )
+
+        self.get_logger().info(
+            f'Camera origin in {grid_frame}: {camera_origin}'
+        )
 
         self.publish_feedback(goal_handle, 'ray_casting_objects_to_voxels', 0.80)
 
         try:
-            json_objects_3d, updated_json_matrix = assign_objects_to_voxels(
+            json_objects_3d = assign_objects_to_voxels(
                 json_objects=eval_response.json_objects,
-                json_matrix=capture_response.json_matrix,
-                camera_origin_base=camera_origin_base,
-                rotation_base_camera=rotation_base_camera,
-                fx=self.fx,
-                fy=self.fy,
-                cx=self.cx,
-                cy=self.cy,
-                ray_step=RAY_STEP,
-                ray_max_distance=RAY_MAX_DISTANCE,
-                occupied_passable_value=OCCUPIED_PASSABLE_VALUE
+                scene=scene,
+                camera_origin=camera_origin,
+                rotation_frame_camera=rotation_frame_camera,
+                fx=fx,
+                fy=fy,
+                cx=cx,
+                cy=cy,
+                ray_max_distance=float(self.get_parameter('ray_max_distance').value),
             )
 
         except Exception as exc:
-            result.success = False
-            result.error_msg = f'Ray casting failed: {str(exc)}'
-            result.json_matrix = capture_response.json_matrix
-            result.json_objects_3d = '[]'
-            goal_handle.abort()
-            return result
+            return self.abort_generate_scene(
+                goal_handle,
+                f'Ray casting failed: {str(exc)}',
+                capture_response.json_matrix
+            )
 
         self.get_logger().info(
             f'Objects 3D: {json_objects_3d}'
         )
 
+        result = GenerateScene.Result()
         result.success = True
         result.error_msg = ''
-        result.json_matrix = updated_json_matrix
+        result.json_matrix = capture_response.json_matrix
         result.json_objects_3d = json_objects_3d
 
-        self.latest_json_matrix = updated_json_matrix
+        self.latest_json_matrix = capture_response.json_matrix
         self.latest_voxel_size = goal.voxel_size
 
         self.publish_feedback(goal_handle, 'done', 1.0)
@@ -561,9 +605,12 @@ class OrchestratorURServer(Node):
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = OrchestratorURServer()
+    # Several threads: GenerateScene blocks while waiting for service responses
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
 
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
