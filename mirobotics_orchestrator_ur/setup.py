@@ -28,6 +28,7 @@ setup(
     entry_points={
         'console_scripts': [
             'orchestrator_ur_server = mirobotics_orchestrator_ur.orchestrator_ur_server:main',
+            'help = mirobotics_orchestrator_ur.help:main',
         ],
     },
 )

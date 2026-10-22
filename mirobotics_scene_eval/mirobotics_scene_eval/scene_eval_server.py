@@ -61,9 +61,9 @@ class SceneEvalServer(Node):
             callback_group=self._image_callback_group,
         )
 
-        self._service = self.create_service(
+        self._eval_scene_service = self.create_service(
             EvalScene,
-            '/mirobotics_scene_eval/mirobotics_eval_scene',
+            'eval_scene',
             self._handle_eval_scene,
         )
 

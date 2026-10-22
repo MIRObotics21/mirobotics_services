@@ -1,6 +1,11 @@
+# Run the YOLO model on the latest camera image (service /eval_scene).
+# Model .pt or .onnx. Empty uses the default_model_path parameter.
 string model_path
+# Directory or image file for the annotated image. Empty uses the
+# default_annotated_image_path parameter, empty parameter saves no image.
 string annotated_image_path
 ---
 bool success
 string error_msg
+# [{"id", "type", "u", "v", "confidence"}], u and v are the box center in pixels
 string json_objects

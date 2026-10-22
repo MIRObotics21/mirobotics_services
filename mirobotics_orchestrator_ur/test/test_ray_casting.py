@@ -62,6 +62,21 @@ def test_parse_scene_grid():
     assert scene.center((5, 5, 2)) == [0.05, 0.05, 0.25]
 
 
+def test_summary_json_has_grid_without_matrix():
+    summary = json.loads(scene_with_box().summary_json())
+
+    assert summary == {
+        'voxel_size': VOXEL_SIZE,
+        'occupied_voxels': 3,
+        'grid': {
+            'min_index': MIN_INDEX,
+            'shape': list(SHAPE),
+            'origin': [-0.5, -0.5, 0.0],
+            'frame_id': 'base_link',
+        },
+    }
+
+
 def test_parse_scene_grid_rejects_invalid_input():
     occupancy = np.zeros(SHAPE, dtype=bool)
     data = json.loads(make_json_matrix(occupancy))

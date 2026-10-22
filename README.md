@@ -18,6 +18,30 @@ The framework consists of four ROS 2 packages:
 
 ---
 
+# Help
+
+Each package prints its services or actions, parameters and copy-paste examples:
+
+```bash
+ros2 run mirobotics_scene_eval help
+ros2 run mirobotics_path_planner help
+ros2 run mirobotics_orchestrator_ur help
+```
+
+A single topic, for example only the PlanPath service:
+
+```bash
+ros2 run mirobotics_path_planner help plan_path
+```
+
+Every request, response and feedback field is described in the interface definitions:
+
+```bash
+ros2 interface show mirobotics_msg/srv/PlanPath
+```
+
+---
+
 # System Architecture
 
 ```text
@@ -101,7 +125,7 @@ image_publisher:=/camera/camera/color/image_raw
 
 ```bash
 ros2 service call \
-/mirobotics_scene_eval/mirobotics_eval_scene \
+/eval_scene \
 mirobotics_msg/srv/EvalScene \
 "{model_path: '/home/mirobotics/models/best.onnx',
 annotated_image_path: '/home/mirobotics/output/'}"
@@ -192,17 +216,29 @@ success: true
 json_matrix:
 {
  "voxel_size": 0.1,
+ "occupied_voxels": 112,
  "grid": {
   "min_index": [-5, -5, 0],
   "shape": [10, 10, 6],
   "origin": [-0.5, -0.5, 0.0],
   "frame_id": "base_link"
- },
- "matrix": [...]
+ }
 }
 ```
 
-Matrix rows are `[id, x, y, z, passable]`, where `passable` is `1.0` for free and `0.0` for occupied voxels.
+The response does not list the voxels by default, the full list floods the console.
+Request it with `include_matrix: true` (GenerateScene does this for the ray projection):
+
+```bash
+ros2 service call \
+/capture_scene \
+mirobotics_msg/srv/CaptureScene \
+"{voxel_size: 0.1, include_matrix: true}"
+```
+
+`json_matrix` then also contains `"matrix": [...]` with rows `[id, x, y, z, passable]`,
+where `passable` is `1.0` for free and `0.0` for occupied voxels.
+The grid itself is always kept by the path planner for PlanPath, independent of `include_matrix`.
 
 The grid is fixed by the workspace box and `voxel_size`, so voxel ids do not change between captures.
 With `shape = [nx, ny, nz]` and voxel index `[ix, iy, iz]`:
@@ -354,6 +390,10 @@ voxel_size: 0.02}" --feedback
 Result:
 success: true
 
+json_matrix:
+{"voxel_size": 0.02, "occupied_voxels": 10180,
+ "grid": {"min_index": [-25, -25, -3], "shape": [50, 50, 33], "origin": [-0.5, -0.5, -0.06], "frame_id": "base_link"}}
+
 json_objects_3d:
 [
  {
@@ -368,6 +408,9 @@ json_objects_3d:
  }
 ]
 ```
+
+Like CaptureScene, `json_matrix` lists every voxel only with `include_matrix: true` in the goal.
+PlanAndExecute works either way, the orchestrator always keeps the full grid.
 
 * `object_voxel_id`, `object_point`: first occupied voxel hit by the ray and its center
 * `hit_point`: exact point where the ray enters that voxel

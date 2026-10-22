@@ -1,5 +1,14 @@
+# Voxelize the latest point clouds inside the workspace box (service /capture_scene).
+# The grid is kept by the path planner and used by PlanPath.
+# Edge length of a voxel in meters.
 float32 voxel_size
+# Also return every voxel in json_matrix "matrix". Off by default to keep the
+# response short, GenerateScene turns it on for the ray projection.
+bool include_matrix false
 ---
 bool success
 string error_msg
+# {"voxel_size", "occupied_voxels", "grid": {"min_index", "shape", "origin", "frame_id"}}
+# with include_matrix also "matrix": [[id, x, y, z, passable], ...],
+# passable 1.0 = free, 0.0 = occupied
 string json_matrix

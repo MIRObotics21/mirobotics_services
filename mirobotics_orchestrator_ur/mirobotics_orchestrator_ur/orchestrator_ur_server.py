@@ -30,7 +30,7 @@ from mirobotics_msg.srv import EvalScene, CaptureScene, PlanPath
 from mirobotics_orchestrator_ur.ray_casting import assign_objects_to_voxels, parse_scene_grid
 
 BASE_FRAME = 'base_link'
-SCENE_EVAL_SERVICE = '/mirobotics_scene_eval/mirobotics_eval_scene'
+SCENE_EVAL_SERVICE = '/eval_scene'
 CAPTURE_SCENE_SERVICE = '/capture_scene'
 PLAN_PATH_SERVICE = '/plan_path'
 
@@ -369,7 +369,8 @@ class OrchestratorURServer(Node):
         service_timeout = float(self.get_parameter('service_timeout').value)
 
         self.get_logger().info(
-            f'Goal model_path="{goal.model_path}", voxel_size={goal.voxel_size}'
+            f'Goal model_path="{goal.model_path}", voxel_size={goal.voxel_size}, '
+            f'include_matrix={goal.include_matrix}'
         )
 
         if not self.camera_info_received:
@@ -422,6 +423,8 @@ class OrchestratorURServer(Node):
 
         capture_request = CaptureScene.Request()
         capture_request.voxel_size = goal.voxel_size
+        # Ray projection needs every voxel
+        capture_request.include_matrix = True
 
         try:
             capture_response = self.call_service(
@@ -444,8 +447,13 @@ class OrchestratorURServer(Node):
             return self.abort_generate_scene(
                 goal_handle,
                 f'Invalid CaptureScene json_matrix: {exc}',
-                capture_response.json_matrix
+                capture_response.json_matrix if goal.include_matrix else ''
             )
+
+        # Every voxel only on request, the full matrix floods the console of ros2 action send_goal
+        result_json_matrix = (
+            capture_response.json_matrix if goal.include_matrix else scene.summary_json()
+        )
 
         grid_frame = scene.frame_id or BASE_FRAME
 
@@ -463,7 +471,7 @@ class OrchestratorURServer(Node):
             return self.abort_generate_scene(
                 goal_handle,
                 f'Could not get TF {grid_frame} <- {self.camera_frame}: {str(exc)}',
-                capture_response.json_matrix
+                result_json_matrix
             )
 
         self.get_logger().info(
@@ -489,7 +497,7 @@ class OrchestratorURServer(Node):
             return self.abort_generate_scene(
                 goal_handle,
                 f'Ray casting failed: {str(exc)}',
-                capture_response.json_matrix
+                result_json_matrix
             )
 
         self.get_logger().info(
@@ -509,9 +517,10 @@ class OrchestratorURServer(Node):
         result = GenerateScene.Result()
         result.success = True
         result.error_msg = ''
-        result.json_matrix = capture_response.json_matrix
+        result.json_matrix = result_json_matrix
         result.json_objects_3d = json_objects_3d
 
+        # PlanAndExecute looks voxels up by id, keep the full matrix
         self.latest_json_matrix = capture_response.json_matrix
         self.latest_voxel_size = goal.voxel_size
 

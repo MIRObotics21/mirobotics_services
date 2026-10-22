@@ -26,6 +26,19 @@ class SceneGrid:
         center = (np.asarray(index) + self.min_index + 0.5) * self.voxel_size
         return [round(float(c), 4) for c in center]
 
+    def summary_json(self) -> str:
+        """json_matrix without the "matrix" list, same layout as CaptureScene without include_matrix."""
+        return json.dumps({
+            'voxel_size': self.voxel_size,
+            'occupied_voxels': int(self.occupancy.sum()),
+            'grid': {
+                'min_index': [int(i) for i in self.min_index],
+                'shape': list(self.shape),
+                'origin': [round(float(i * self.voxel_size), 6) for i in self.min_index],
+                'frame_id': self.frame_id,
+            },
+        })
+
 
 def normalize_vector(vector: Sequence[float]) -> np.ndarray:
     vector = np.asarray(vector, dtype=np.float64)

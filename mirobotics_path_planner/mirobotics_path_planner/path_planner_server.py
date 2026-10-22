@@ -37,7 +37,7 @@ from mirobotics_path_planner.voxel_grid import (
 )
 
 
-class CaptureSceneServer(Node):
+class PathPlannerServer(Node):
     def __init__(self) -> None:
         super().__init__('path_planner_server')
 
@@ -404,9 +404,13 @@ class CaptureSceneServer(Node):
 
             payload = {
                 'voxel_size': round(voxel_size, 4),
+                'occupied_voxels': int(occupancy.sum()),
                 'grid': grid,
-                'matrix': cube_matrix.tolist(),
             }
+
+            # Every voxel only on request, the full matrix floods the console of ros2 service call
+            if request.include_matrix:
+                payload['matrix'] = cube_matrix.tolist()
 
             scene_json = json.dumps(payload)
 
@@ -653,7 +657,7 @@ class CaptureSceneServer(Node):
 
 def main(args=None) -> None:
     rclpy.init(args=args)
-    node = CaptureSceneServer()
+    node = PathPlannerServer()
     executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(node)
 

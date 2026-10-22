@@ -1,10 +1,23 @@
+# EvalScene + CaptureScene + ray projection of the detections into the voxel grid
+# (action /generate_scene).
+# Model .pt or .onnx. Empty uses the default model of the scene evaluation.
 string model_path
+# Edge length of a voxel in meters.
 float32 voxel_size
+# Also return every voxel in json_matrix "matrix". Off by default to keep the
+# result short. PlanAndExecute works either way.
+bool include_matrix false
 ---
 bool success
 string error_msg
+# {"voxel_size", "occupied_voxels", "grid": {"min_index", "shape", "origin", "frame_id"}}
+# with include_matrix also "matrix": [[id, x, y, z, passable], ...]
 string json_matrix
+# [{"id", "type", "confidence", "object_voxel_id", "object_point", "hit_point",
+#   "approach_voxel_id", "approach_point"}], points [x, y, z] in the grid frame,
+# null when the ray hit nothing
 string json_objects_3d
 ---
+# Name of the step being executed and progress 0.0 - 1.0
 string current_step
 float32 progress

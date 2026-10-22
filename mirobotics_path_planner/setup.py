@@ -28,6 +28,7 @@ setup(
     entry_points={
         'console_scripts': [
             'path_planner_server = mirobotics_path_planner.path_planner_server:main',
+            'help = mirobotics_path_planner.help:main',
         ],
     },
 )
