@@ -23,7 +23,7 @@ The framework consists of four ROS 2 packages:
 ```bash
 cd ~/ros2_ws/src
 
-git clone https://github.com/MIRObotics21/mirobotics_services.git
+git clone --branch bp_kyvala --single-branch https://github.com/MIRObotics21/mirobotics_services.git
 
 cd ~/ros2_ws
 
