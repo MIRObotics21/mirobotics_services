@@ -18,7 +18,7 @@ The framework consists of four ROS 2 packages:
 
 ---
 
-# Install & Build
+# Clone & Build
 
 ```bash
 cd ~/ros2_ws/src
