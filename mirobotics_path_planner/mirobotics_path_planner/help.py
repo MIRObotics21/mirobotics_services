@@ -72,15 +72,15 @@ TOPICS = {
 """,
     'parameters': """\
 Parameters (ros2 param set /path_planner_server <name> <value>)
-  planning_frame        ''                  Frame of the grid, empty = point cloud frame (launch: base_link)
+  planning_frame        ''                  Grid frame, empty = cloud frame (launch: base_link)
   workspace_min         [-0.5, -0.5, 0.0]   Minimum corner of the workspace box in meters
   workspace_max         [0.5, 0.5, 0.6]     Maximum corner of the workspace box in meters
   min_points_per_voxel  3                   Points needed to mark a voxel occupied
   fill_below_occupied   true                Mark everything under the top surface occupied
   max_voxels            2000000             capture_scene fails for larger grids
-  max_cloud_age         2.0                 Maximum age of the point clouds in seconds, 0 = no check
+  max_cloud_age         2.0                 Maximum age of the clouds in seconds, 0 = no check
   publish_markers       true                Publish RViz markers
-  clearance_voxels      2                   Clearance zone (2 * n + 1)^3 cube around occupied voxels
+  clearance_voxels      2                   Clearance zone, (2 * n + 1)^3 cube around obstacles
   clearance_cost        5.0                 Cost factor of the clearance zone, 1.0 = no clearance
   snap_distance         0.05                Snap distance for occupied start/goal points in meters
 """,

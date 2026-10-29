@@ -27,7 +27,7 @@ class SceneGrid:
         return [round(float(c), 4) for c in center]
 
     def summary_json(self) -> str:
-        """json_matrix without the "matrix" list, same layout as CaptureScene without include_matrix."""
+        """Return json_matrix without the "matrix" list, like CaptureScene does by default."""
         return json.dumps({
             'voxel_size': self.voxel_size,
             'occupied_voxels': int(self.occupancy.sum()),
@@ -59,14 +59,13 @@ def pixel_to_camera_ray(
     cy: float
 ) -> np.ndarray:
     """
-    Converts RGB pixel coordinate into a ray in camera optical frame.
+    Convert RGB pixel coordinate into a ray in camera optical frame.
 
     ROS optical frame convention:
         x -> right
         y -> down
         z -> forward
     """
-
     x = (u - cx) / fx
     y = (v - cy) / fy
     z = 1.0
@@ -76,10 +75,13 @@ def pixel_to_camera_ray(
 
 def parse_scene_grid(json_matrix: str) -> SceneGrid:
     """
-    Expected format (CaptureScene of mirobotics_path_planner):
+    Parse the CaptureScene json_matrix of mirobotics_path_planner.
+
+    Expected format:
     {
         "voxel_size": 0.1,
-        "grid": {"min_index": [...], "shape": [nx, ny, nz], "origin": [...], "frame_id": "base_link"},
+        "grid": {"min_index": [...], "shape": [nx, ny, nz], "origin": [...],
+                 "frame_id": "base_link"},
         "matrix": [
             [id, x, y, z, passable],
             ...
@@ -87,7 +89,6 @@ def parse_scene_grid(json_matrix: str) -> SceneGrid:
     }
     Rows are ordered by id = (ix * ny + iy) * nz + iz.
     """
-
     data = json.loads(json_matrix)
 
     if not isinstance(data, dict) or 'matrix' not in data:
@@ -122,6 +123,8 @@ def parse_scene_grid(json_matrix: str) -> SceneGrid:
 
 def parse_scene_objects(json_objects: str) -> List[Dict]:
     """
+    Parse the EvalScene json_objects.
+
     Expected format:
     [
         {
@@ -133,7 +136,6 @@ def parse_scene_objects(json_objects: str) -> List[Dict]:
         }
     ]
     """
-
     data = json.loads(json_objects)
 
     if not isinstance(data, list):
@@ -149,7 +151,7 @@ def cast_ray(
     max_distance: float,
 ) -> Optional[Tuple[GridIndex, float]]:
     """
-    Voxel traversal (Amanatides & Woo) along the ray until the first occupied voxel.
+    Trace the ray voxel by voxel (Amanatides & Woo) until the first occupied voxel.
 
     The origin may lie outside the grid, the ray is first clipped to the grid box.
     Every voxel the ray passes through is visited exactly once, so no voxel is
@@ -160,7 +162,6 @@ def cast_ray(
         point where the ray enters it, or None when nothing is hit within
         max_distance
     """
-
     origin = np.asarray(origin, dtype=np.float64)
     direction = normalize_vector(direction)
     voxel_size = scene.voxel_size
@@ -230,10 +231,10 @@ def cast_ray(
 
 def find_approach_voxel(scene: SceneGrid, hit_index: Sequence[int]) -> Optional[GridIndex]:
     """
-    First free voxel above the hit voxel in the same column.
+    Find the first free voxel above the hit voxel in the same column.
+
     Returns None when the column is occupied up to the top of the grid.
     """
-
     ix, iy, iz = (int(i) for i in hit_index)
     free = np.flatnonzero(~scene.occupancy[ix, iy, iz + 1:])
 
@@ -255,7 +256,7 @@ def assign_objects_to_voxels(
     ray_max_distance: float = 3.0,
 ) -> str:
     """
-    Assigns SceneEval 2D detections to occupied voxels.
+    Assign SceneEval 2D detections to occupied voxels.
 
     scene is the voxel grid from parse_scene_grid. camera_origin and
     rotation_frame_camera describe the camera optical frame in the frame of
@@ -266,7 +267,6 @@ def assign_objects_to_voxels(
     The first occupied voxel is the object voxel, the first free voxel above
     it is the approach voxel. Missing voxels are reported as None.
     """
-
     detections = parse_scene_objects(json_objects)
     rotation = np.asarray(rotation_frame_camera, dtype=np.float64)
     origin = np.asarray(camera_origin, dtype=np.float64)

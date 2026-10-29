@@ -106,7 +106,7 @@ class AStar3D:
 
     def _build_moves(self) -> List[Tuple[int, float, Tuple[int, ...]]]:
         """
-        Returns (flat offset, move length, offsets that must be free) per move.
+        Return (flat offset, move length, offsets that must be free) per move.
 
         A diagonal move is allowed only if every axis-aligned and edge move it is
         composed of is free, so the path never cuts a corner of an occupied voxel.
@@ -144,8 +144,9 @@ class AStar3D:
 
     def nearest_free(self, index: Sequence[int], max_radius: int) -> Optional[GridIndex]:
         """
-        Closest free voxel within max_radius voxels (cube), preferring higher voxels on ties.
-        Returns None when there is none.
+        Find the closest free voxel within max_radius voxels (cube).
+
+        Higher voxels are preferred on ties. Returns None when there is none.
         """
         if not self.in_grid(index):
             return None
@@ -183,8 +184,10 @@ class AStar3D:
 
     def plan(self, start: Sequence[int], goal: Sequence[int]) -> List[GridIndex]:
         """
-        Returns the list of grid indices from start to goal, both included.
-        Returns an empty list when the goal cannot be reached.
+        Plan a path from start to goal.
+
+        Returns the list of grid indices from start to goal, both included,
+        or an empty list when the goal cannot be reached.
         """
         start = tuple(int(i) for i in start)
         goal = tuple(int(i) for i in goal)
@@ -256,8 +259,10 @@ class AStar3D:
 
     def _segment_allowed(self, a: GridIndex, b: GridIndex, max_cost_factor: float) -> bool:
         """
-        Straight segment from a to b is allowed if it touches no occupied voxel
-        and no voxel more expensive than max_cost_factor.
+        Check whether the straight segment from a to b may replace the path.
+
+        It is allowed if it touches no occupied voxel and no voxel more
+        expensive than max_cost_factor.
         """
         a = np.asarray(a, dtype=np.float64)
         b = np.asarray(b, dtype=np.float64)

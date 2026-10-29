@@ -25,6 +25,7 @@ LOGGER.disabled = True
 
 IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp')
 
+
 class SceneEvalServer(Node):
     def __init__(self) -> None:
         super().__init__('scene_eval_server')
@@ -95,8 +96,9 @@ class SceneEvalServer(Node):
 
     def _preload_default_model(self) -> None:
         """
-        Load default_model_path at startup so the first request is not delayed
-        and a wrong path is reported immediately.
+        Load default_model_path at startup.
+
+        The first request is not delayed and a wrong path is reported immediately.
         """
         model_path = str(self.get_parameter('default_model_path').value).strip()
 
@@ -127,6 +129,8 @@ class SceneEvalServer(Node):
 
     def _save_annotated_image(self, annotated, save_path: str) -> None:
         """
+        Save the annotated image.
+
         save_path with an image extension is used as the file path,
         anything else is a directory that receives 'annotated.png'.
         """
@@ -148,7 +152,9 @@ class SceneEvalServer(Node):
 
     def _evaluate_scene(self, model_path: str, cv_image, save_path: str):
         """
-        Return a JSON-serializable Python list:
+        Run the model on the image and return the detected objects.
+
+        Returns a JSON-serializable Python list:
         [
             {
                 "id": 1,
@@ -210,10 +216,12 @@ class SceneEvalServer(Node):
 
     def _handle_eval_scene(self, request: EvalScene.Request, response: EvalScene.Response):
         default_model_path = str(self.get_parameter('default_model_path').value)
-        default_annotated_image_path = str(self.get_parameter('default_annotated_image_path').value)
+        default_annotated_image_path = str(
+            self.get_parameter('default_annotated_image_path').value
+        )
 
-        model_path = request.model_path.strip() if request.model_path.strip() else default_model_path
-        annotated_image_path = request.annotated_image_path.strip() if request.annotated_image_path.strip() else default_annotated_image_path
+        model_path = request.model_path.strip() or default_model_path
+        annotated_image_path = request.annotated_image_path.strip() or default_annotated_image_path
 
         if not model_path:
             response.success = False
@@ -266,6 +274,7 @@ class SceneEvalServer(Node):
         self.get_logger().info(f'Scene evaluation succeeded. Found {len(objects)} object(s).')
         return response
 
+
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = SceneEvalServer()
@@ -282,6 +291,7 @@ def main(args=None) -> None:
         except Exception:
             pass
         rclpy.try_shutdown()
+
 
 if __name__ == '__main__':
     main()

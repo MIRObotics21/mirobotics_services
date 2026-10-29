@@ -18,6 +18,22 @@ The framework consists of four ROS 2 packages:
 
 ---
 
+# Install & Build
+
+```bash
+cd ~/ros2_ws/src
+
+git clone https://github.com/MIRObotics21/mirobotics_services.git
+
+cd ~/ros2_ws
+
+colcon build
+
+source install/setup.bash
+```
+
+---
+
 # Help
 
 Each package prints its services or actions, parameters and copy-paste examples:
@@ -479,18 +495,6 @@ This allows reliable 3D object localization without explicit depth segmentation.
 * NumPy
 * ONNX Runtime
 * TF2
-
----
-
-# Build
-
-```bash
-cd ~/ros2_ws
-
-colcon build
-
-source install/setup.bash
-```
 
 ---
 

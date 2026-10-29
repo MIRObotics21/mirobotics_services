@@ -139,12 +139,14 @@ class PathPlannerServer(Node):
             self._cloud_buffer.append((msg, time.monotonic()))
 
         self.get_logger().debug(
-            f"Received PointCloud2. Buffered {len(self._cloud_buffer)}/{self._buffer_size} messages."
+            f'Received PointCloud2. '
+            f'Buffered {len(self._cloud_buffer)}/{self._buffer_size} messages.'
         )
 
     def _pointcloud2_to_xyz_numpy(self, msg: PointCloud2) -> np.ndarray:
         """
         Convert PointCloud2 to an N x 3 NumPy array [x, y, z].
+
         NaN and infinite points are skipped.
         Only x, y, z fields are extracted.
         """
@@ -277,8 +279,14 @@ class PathPlannerServer(Node):
 
         self._marker_pub.publish(MarkerArray(markers=[occupied, workspace]))
 
-    def _handle_capture_scene(self, request: CaptureScene.Request, response: CaptureScene.Response) -> CaptureScene.Response:
-        self.get_logger().info(f"Received request for voxelization with size: {float(request.voxel_size)}.")
+    def _handle_capture_scene(
+            self,
+            request: CaptureScene.Request,
+            response: CaptureScene.Response,
+    ) -> CaptureScene.Response:
+        self.get_logger().info(
+            f'Received request for voxelization with size: {float(request.voxel_size)}.'
+        )
         if request.voxel_size <= 0.0:
             response.success = False
             response.error_msg = 'voxel_size must be greater than 0.'
@@ -560,7 +568,11 @@ class PathPlannerServer(Node):
 
         self._path_marker_pub.publish(MarkerArray(markers=markers))
 
-    def _handle_plan_path(self, request: PlanPath.Request, response: PlanPath.Response) -> PlanPath.Response:
+    def _handle_plan_path(
+            self,
+            request: PlanPath.Request,
+            response: PlanPath.Response,
+    ) -> PlanPath.Response:
         response.json_path = ''
         response.waypoints = []
 
@@ -609,7 +621,9 @@ class PathPlannerServer(Node):
             time_planned = time.perf_counter()
 
             path_points = [grid_index_to_center(index, min_index, voxel_size) for index in path]
-            waypoints = [grid_index_to_center(index, min_index, voxel_size) for index in simplified]
+            waypoints = [
+                grid_index_to_center(index, min_index, voxel_size) for index in simplified
+            ]
 
             # The robot is at the exact start point, keep it as the first waypoint
             if start_point is not None:
@@ -654,6 +668,7 @@ class PathPlannerServer(Node):
             response.success = False
             response.error_msg = str(exc)
             return response
+
 
 def main(args=None) -> None:
     rclpy.init(args=args)

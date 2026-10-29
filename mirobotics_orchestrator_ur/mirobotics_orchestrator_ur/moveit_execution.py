@@ -13,12 +13,11 @@ def voxel_path_to_poses(
     min_distance: float = 0.03,
 ):
     """
-    Converts PlanPath json_path to MoveIt Cartesian waypoints.
+    Convert PlanPath json_path to MoveIt Cartesian waypoints.
 
     Expected path row:
         [id, x, y, z, passable]
     """
-
     rows = parse_json_path(json_path)
 
     if fixed_orientation is None:
@@ -63,6 +62,7 @@ def voxel_path_to_poses(
         last_position = (x, y, z)
 
     return poses
+
 
 def json_path_to_goal_pose(
     json_path: str,

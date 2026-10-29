@@ -35,13 +35,14 @@ TOPICS = {
 
   Example:
     ros2 service call /eval_scene mirobotics_msg/srv/EvalScene \\
-      "{model_path: '/home/mirobotics/models/best.onnx', annotated_image_path: '/home/mirobotics/output/'}"
+      "{model_path: '/home/mirobotics/models/best.onnx',
+      annotated_image_path: '/home/mirobotics/output/'}"
 
   Fails when no image was received yet or the latest image is older than max_image_age.
 """,
     'parameters': """\
 Parameters (ros2 param set /scene_eval_server <name> <value>)
-  default_model_path            ''     Model used for an empty model_path, loaded at startup if it exists
+  default_model_path            ''     Model for an empty model_path, loaded at startup
   default_annotated_image_path  ''     Used for an empty annotated_image_path, empty = no image
   min_confidence                0.25   Minimum detection confidence
   max_detections                50     Maximum number of detections per image

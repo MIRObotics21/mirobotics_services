@@ -10,7 +10,7 @@ from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
-from geometry_msgs.msg import Point, PointStamped, Pose
+from geometry_msgs.msg import Point, Pose
 from moveit_msgs.action import MoveGroup
 from moveit_msgs.msg import (
     Constraints,
@@ -22,7 +22,13 @@ from shape_msgs.msg import SolidPrimitive
 
 from sensor_msgs.msg import CameraInfo
 from visualization_msgs.msg import Marker, MarkerArray
-from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
+from tf2_ros import (
+    Buffer,
+    ConnectivityException,
+    ExtrapolationException,
+    LookupException,
+    TransformListener,
+)
 
 from mirobotics_msg.action import GenerateScene, PlanAndExecute
 from mirobotics_msg.srv import EvalScene, CaptureScene, PlanPath
@@ -49,6 +55,7 @@ MOVE_GROUP_NAME = 'ur_manipulator'
 MOVEIT_TARGET_LINK = 'tool0'
 TOOL0_TCP_OFFSET_Z = -0.1866
 POSITION_TOLERANCE = 0.03
+
 
 class OrchestratorURServer(Node):
 
@@ -180,13 +187,12 @@ class OrchestratorURServer(Node):
 
     def quaternion_to_rotation_matrix(self, qx, qy, qz, qw):
         """
-        Converts quaternion into 3x3 rotation matrix.
+        Convert quaternion into 3x3 rotation matrix.
 
         The returned matrix transforms vectors from source frame to target frame
         when using a TF transform target <- source.
         """
-
-        norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+        norm =math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
 
         if norm == 0.0:
             raise ValueError('Invalid zero-length quaternion')
@@ -236,11 +242,12 @@ class OrchestratorURServer(Node):
 
     def get_camera_transform(self, target_frame):
         """
+        Look up the camera optical frame in target_frame.
+
         Returns:
             camera_origin: [x, y, z] of the camera optical frame in target_frame
             rotation_target_camera: 3x3 rotation matrix camera -> target_frame
         """
-
         if self.camera_frame is None:
             raise RuntimeError('Camera frame is unknown because CameraInfo was not received')
 
@@ -271,6 +278,8 @@ class OrchestratorURServer(Node):
 
     def publish_object_markers(self, objects_3d, voxel_size, frame_id):
         """
+        Publish the localized objects for RViz.
+
         Per detected object:
             object voxel   - cube in the object type color
             hit point      - small white sphere where the ray enters the object voxel
@@ -397,7 +406,9 @@ class OrchestratorURServer(Node):
         eval_request.annotated_image_path = ''
 
         try:
-            eval_response = self.call_service(self.eval_scene_client, eval_request, service_timeout)
+            eval_response = self.call_service(
+                self.eval_scene_client, eval_request, service_timeout
+            )
         except TimeoutError as exc:
             return self.abort_generate_scene(goal_handle, f'EvalScene failed: {exc}')
 
@@ -729,6 +740,7 @@ class OrchestratorURServer(Node):
             result.error_msg = f'PlanAndExecute failed: {str(exc)}'
             goal_handle.abort()
             return result
+
 
 def main(args=None) -> None:
     rclpy.init(args=args)

@@ -52,7 +52,7 @@ def compute_grid(
         voxel_size: float,
 ) -> Tuple[np.ndarray, Tuple[int, int, int]]:
     """
-    Fixed grid covering the workspace box.
+    Compute the fixed grid covering the workspace box.
 
     The grid is aligned to multiples of voxel_size in the planning frame, so
     voxel centers lie at (index + 0.5) * voxel_size and ids do not depend on
