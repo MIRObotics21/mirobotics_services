@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 from mirobotics_orchestrator_ur.moveit_execution import (
     find_object_target,
+    largest_joint_travel,
     rescale_trajectory,
     tcp_to_tool0_position,
 )
@@ -41,6 +42,23 @@ def test_find_object_target_rejects_unknown_and_unreachable_objects():
     assert raises_value_error(find_object_target, OBJECTS, 7)
     assert raises_value_error(find_object_target, OBJECTS, 2)
     assert raises_value_error(find_object_target, [], 1)
+
+
+def test_largest_joint_travel_finds_full_turn():
+    points = [
+        SimpleNamespace(positions=[0.0, 1.0]),
+        SimpleNamespace(positions=[0.5, 7.0]),
+        SimpleNamespace(positions=[0.2, 1.2]),
+    ]
+
+    name, travel = largest_joint_travel(['shoulder', 'wrist_3'], points)
+
+    assert name == 'wrist_3'
+    assert travel == 6.0
+
+
+def test_largest_joint_travel_of_empty_trajectory():
+    assert largest_joint_travel(['shoulder'], []) == ('', 0.0)
 
 
 def test_rescale_trajectory_slows_down_motion():

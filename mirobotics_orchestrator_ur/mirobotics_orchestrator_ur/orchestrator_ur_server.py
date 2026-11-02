@@ -11,18 +11,16 @@ from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
-from geometry_msgs.msg import Point, Pose
+from geometry_msgs.msg import Point, Pose, PoseArray
 from moveit_msgs.action import ExecuteTrajectory, MoveGroup
 from moveit_msgs.msg import (
     Constraints,
+    JointConstraint,
     MotionPlanRequest,
     MoveItErrorCodes,
-    OrientationConstraint,
     PlanningOptions,
-    PositionConstraint,
 )
 from moveit_msgs.srv import GetCartesianPath
-from shape_msgs.msg import SolidPrimitive
 
 from sensor_msgs.msg import CameraInfo
 from visualization_msgs.msg import Marker, MarkerArray
@@ -39,6 +37,7 @@ from mirobotics_msg.srv import EvalScene, CaptureScene, PlanPath
 
 from mirobotics_orchestrator_ur.moveit_execution import (
     find_object_target,
+    largest_joint_travel,
     rescale_trajectory,
     tcp_to_tool0_position,
 )
@@ -64,9 +63,18 @@ EXECUTE_TRAJECTORY_ACTION = '/execute_trajectory'
 CARTESIAN_PATH_SERVICE = '/compute_cartesian_path'
 MOVE_GROUP_NAME = 'ur_manipulator'
 MOVEIT_TARGET_LINK = 'tool0'
-POSITION_TOLERANCE = 0.01
-ORIENTATION_TOLERANCE = 0.02
+UR_JOINT_NAMES = [
+    'shoulder_pan_joint',
+    'shoulder_lift_joint',
+    'elbow_joint',
+    'wrist_1_joint',
+    'wrist_2_joint',
+    'wrist_3_joint',
+]
+JOINT_TOLERANCE = 0.01
 CARTESIAN_MAX_STEP = 0.005
+# Largest joint change between two Cartesian path steps in radians, stops the path at a flip
+CARTESIAN_REVOLUTE_JUMP = 0.5
 
 
 class OrchestratorURServer(Node):
@@ -89,8 +97,11 @@ class OrchestratorURServer(Node):
         self.declare_parameter('service_timeout', 30.0)
         # Publish object, hit point and approach voxels for RViz after each GenerateScene.
         self.declare_parameter('publish_markers', True)
-        # PlanAndExecute: TCP position [x, y, z] in base_link reached from home with a
-        # joint move, the planned path starts here. Must be set, 0, 0, 0 means not set.
+        # PlanAndExecute: joint positions in radians, in the order of UR_JOINT_NAMES, of the
+        # ready pose with the tool pointing down. Must be set, all zeros means not set.
+        self.declare_parameter('ready_joints', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        # PlanAndExecute: TCP position [x, y, z] in base_link at ready_joints, the planned
+        # path starts here. Must be set, 0, 0, 0 means not set.
         self.declare_parameter('ready_point', [0.0, 0.0, 0.0])
         # PlanAndExecute: distance from tool0 to the TCP along the tool axis, in meters.
         self.declare_parameter('tcp_offset', 0.1866)
@@ -100,6 +111,10 @@ class OrchestratorURServer(Node):
         self.declare_parameter('speed_scaling', 0.1)
         # PlanAndExecute: maximum duration of one motion in seconds.
         self.declare_parameter('motion_timeout', 120.0)
+        # PlanAndExecute: a plan is rejected if one joint travels more than this, in radians.
+        self.declare_parameter('max_joint_travel', 3.14)
+        # PlanAndExecute: plan and publish everything but do not move the robot.
+        self.declare_parameter('dry_run', False)
 
         self.camera_info_received = False
         self.fx = None
@@ -161,6 +176,12 @@ class OrchestratorURServer(Node):
         self.object_marker_pub = self.create_publisher(
             MarkerArray,
             'scene_object_markers',
+            marker_qos
+        )
+
+        self.tool0_pose_pub = self.create_publisher(
+            PoseArray,
+            'planned_tool0_poses',
             marker_qos
         )
 
@@ -588,63 +609,21 @@ class OrchestratorURServer(Node):
             f'PlanAndExecute feedback: {current_step} ({progress:.2f})'
         )
 
-    def create_tool0_position_constraint(self, x, y, z):
-        constraint = PositionConstraint()
-        constraint.header.frame_id = BASE_FRAME
-        constraint.link_name = MOVEIT_TARGET_LINK
-        constraint.weight = 1.0
-
-        primitive = SolidPrimitive()
-        primitive.type = SolidPrimitive.BOX
-        primitive.dimensions = [
-            POSITION_TOLERANCE,
-            POSITION_TOLERANCE,
-            POSITION_TOLERANCE,
-        ]
-
-        pose = Pose()
-        pose.position.x = float(x)
-        pose.position.y = float(y)
-        pose.position.z = float(z)
-        pose.orientation.w = 1.0
-
-        constraint.constraint_region.primitives.append(primitive)
-        constraint.constraint_region.primitive_poses.append(pose)
-
-        return constraint
-
-    def create_tool0_orientation_constraint(self):
-        tool_orientation = self.get_parameter('tool_orientation').value
-
-        constraint = OrientationConstraint()
-        constraint.header.frame_id = BASE_FRAME
-        constraint.link_name = MOVEIT_TARGET_LINK
-        constraint.orientation.x = float(tool_orientation[0])
-        constraint.orientation.y = float(tool_orientation[1])
-        constraint.orientation.z = float(tool_orientation[2])
-        constraint.orientation.w = float(tool_orientation[3])
-        constraint.absolute_x_axis_tolerance = ORIENTATION_TOLERANCE
-        constraint.absolute_y_axis_tolerance = ORIENTATION_TOLERANCE
-        constraint.absolute_z_axis_tolerance = ORIENTATION_TOLERANCE
-        constraint.weight = 1.0
-
-        return constraint
-
-    def create_move_group_goal(self, tool0_x, tool0_y, tool0_z):
+    def create_move_group_goal(self, joint_positions):
+        """Create a joint space goal, every run ends in the same arm configuration."""
         speed_scaling = float(self.get_parameter('speed_scaling').value)
 
         constraints = Constraints()
-        constraints.name = 'tool0_pose_goal'
-        constraints.position_constraints.append(
-            self.create_tool0_position_constraint(
-                tool0_x,
-                tool0_y,
-                tool0_z
-            )
-        )
-        constraints.orientation_constraints.append(
-            self.create_tool0_orientation_constraint()
-        )
+        constraints.name = 'ready_joints_goal'
+
+        for name, position in zip(UR_JOINT_NAMES, joint_positions):
+            constraint = JointConstraint()
+            constraint.joint_name = name
+            constraint.position = float(position)
+            constraint.tolerance_above = JOINT_TOLERANCE
+            constraint.tolerance_below = JOINT_TOLERANCE
+            constraint.weight = 1.0
+            constraints.joint_constraints.append(constraint)
 
         request = MotionPlanRequest()
         request.group_name = MOVE_GROUP_NAME
@@ -655,7 +634,8 @@ class OrchestratorURServer(Node):
         request.goal_constraints.append(constraints)
 
         planning_options = PlanningOptions()
-        planning_options.plan_only = False
+        # Executed separately after the joint travel check
+        planning_options.plan_only = True
         planning_options.look_around = False
         planning_options.replan = False
 
@@ -677,10 +657,10 @@ class OrchestratorURServer(Node):
 
     def run_motion(self, goal_handle, client, motion_goal, name):
         """
-        Send a motion goal to MoveIt and wait until it finishes.
+        Send a goal to MoveIt and wait until it finishes.
 
-        Returns False when PlanAndExecute was canceled, the motion is then canceled too.
-        Raises on timeout and on any MoveIt error.
+        Returns the MoveIt result, or None when PlanAndExecute was canceled, the
+        goal is then canceled too. Raises on timeout and on any MoveIt error.
         """
         if not client.wait_for_server(timeout_sec=10.0):
             raise RuntimeError(f'{name} action server not available')
@@ -703,18 +683,61 @@ class OrchestratorURServer(Node):
             if goal_handle.is_cancel_requested:
                 motion_handle.cancel_goal_async()
                 done.wait(5.0)
-                return False
+                return None
 
             if time.monotonic() > deadline:
                 motion_handle.cancel_goal_async()
                 raise TimeoutError(f'{name} did not finish within {timeout_sec:.1f} s')
 
-        error_code = result_future.result().result.error_code.val
+        motion_result = result_future.result().result
+        error_code = motion_result.error_code.val
 
         if error_code != MoveItErrorCodes.SUCCESS:
             raise RuntimeError(f'{name} failed with MoveIt error code {error_code}')
 
-        return True
+        return motion_result
+
+    def create_tool0_pose(self, x, y, z):
+        tool_orientation = self.get_parameter('tool_orientation').value
+
+        pose = Pose()
+        pose.position.x = float(x)
+        pose.position.y = float(y)
+        pose.position.z = float(z)
+        pose.orientation.x = float(tool_orientation[0])
+        pose.orientation.y = float(tool_orientation[1])
+        pose.orientation.z = float(tool_orientation[2])
+        pose.orientation.w = float(tool_orientation[3])
+
+        return pose
+
+    def publish_tool0_poses(self, poses):
+        pose_array = PoseArray()
+        pose_array.header.frame_id = BASE_FRAME
+        pose_array.header.stamp = self.get_clock().now().to_msg()
+        pose_array.poses = list(poses)
+
+        self.tool0_pose_pub.publish(pose_array)
+
+    def check_joint_travel(self, trajectory, name):
+        """Reject a planned trajectory that turns one joint further than max_joint_travel."""
+        limit = float(self.get_parameter('max_joint_travel').value)
+        joint_trajectory = trajectory.joint_trajectory
+        joint_name, travel = largest_joint_travel(
+            joint_trajectory.joint_names,
+            joint_trajectory.points
+        )
+
+        self.get_logger().info(
+            f'{name}: {len(joint_trajectory.points)} points, '
+            f'largest joint travel {math.degrees(travel):.1f} deg on {joint_name}'
+        )
+
+        if travel > limit:
+            raise RuntimeError(
+                f'{name} rejected: {joint_name} would travel {math.degrees(travel):.1f} deg, '
+                f'max_joint_travel is {math.degrees(limit):.1f} deg'
+            )
 
     def resolve_plan_target(self, goal):
         if goal.object_id >= 0:
@@ -727,10 +750,13 @@ class OrchestratorURServer(Node):
 
         return target
 
-    def compute_cartesian_path(self, waypoints):
-        """Return a slowed down MoveIt trajectory through the TCP waypoints, tool pointing down."""
-        tcp_offset = float(self.get_parameter('tcp_offset').value)
-        tool_orientation = self.get_parameter('tool_orientation').value
+    def compute_cartesian_path(self, tool0_poses, start_trajectory=None):
+        """
+        Return a slowed down MoveIt trajectory through the tool0 poses.
+
+        The path starts at the current robot state, or at the end of
+        start_trajectory when given.
+        """
         service_timeout = float(self.get_parameter('service_timeout').value)
 
         if not self.cartesian_path_client.wait_for_service(timeout_sec=5.0):
@@ -743,22 +769,16 @@ class OrchestratorURServer(Node):
         request.link_name = MOVEIT_TARGET_LINK
         request.max_step = CARTESIAN_MAX_STEP
         request.jump_threshold = 0.0
+        request.revolute_jump_threshold = CARTESIAN_REVOLUTE_JUMP
         request.avoid_collisions = True
+        request.waypoints = list(tool0_poses)
 
-        for waypoint in waypoints:
-            x, y, z = tcp_to_tool0_position((waypoint.x, waypoint.y, waypoint.z), tcp_offset)
+        if start_trajectory is not None:
+            joint_trajectory = start_trajectory.joint_trajectory
+            request.start_state.joint_state.name = list(joint_trajectory.joint_names)
+            request.start_state.joint_state.position = list(joint_trajectory.points[-1].positions)
 
-            pose = Pose()
-            pose.position.x = x
-            pose.position.y = y
-            pose.position.z = z
-            pose.orientation.x = float(tool_orientation[0])
-            pose.orientation.y = float(tool_orientation[1])
-            pose.orientation.z = float(tool_orientation[2])
-            pose.orientation.w = float(tool_orientation[3])
-            request.waypoints.append(pose)
-
-        response = self.call_service(self.cartesian_path_client, request, service_timeout)
+        response =self.call_service(self.cartesian_path_client, request, service_timeout)
 
         if response.error_code.val != MoveItErrorCodes.SUCCESS:
             raise RuntimeError(f'Cartesian path failed with error code {response.error_code.val}')
@@ -812,7 +832,12 @@ class OrchestratorURServer(Node):
         goal = goal_handle.request
         tcp_offset = float(self.get_parameter('tcp_offset').value)
         service_timeout = float(self.get_parameter('service_timeout').value)
+        ready_joints = list(self.get_parameter('ready_joints').value)
         ready_point = list(self.get_parameter('ready_point').value)
+        dry_run = bool(self.get_parameter('dry_run').value)
+
+        if len(ready_joints) != len(UR_JOINT_NAMES) or not any(ready_joints):
+            raise ValueError('Set the ready_joints parameter to 6 joint positions')
 
         if not any(ready_point):
             raise ValueError('Set the ready_point parameter')
@@ -820,17 +845,36 @@ class OrchestratorURServer(Node):
         target = self.resolve_plan_target(goal)
         self.get_logger().info(f'Ready point: {ready_point}, target: {target}')
 
-        self.publish_plan_feedback(goal_handle, 'moving_to_ready_point', 0.10)
+        self.publish_plan_feedback(goal_handle, 'planning_to_ready_point', 0.10)
 
         tool0_ready = tcp_to_tool0_position(ready_point, tcp_offset)
+        self.publish_tool0_poses([self.create_tool0_pose(*tool0_ready)])
 
-        if not self.run_motion(
+        ready_plan = self.run_motion(
             goal_handle,
             self.move_group_client,
-            self.create_move_group_goal(*tool0_ready),
-            'MoveGroup'
-        ):
+            self.create_move_group_goal(ready_joints),
+            'MoveGroup planning'
+        )
+
+        if ready_plan is None:
             return self.cancel_plan_and_execute(goal_handle)
+
+        self.check_joint_travel(ready_plan.planned_trajectory, 'Move to ready point')
+
+        if not dry_run:
+            self.publish_plan_feedback(goal_handle, 'moving_to_ready_point', 0.20)
+
+            ready_goal = ExecuteTrajectory.Goal()
+            ready_goal.trajectory = ready_plan.planned_trajectory
+
+            if self.run_motion(
+                goal_handle,
+                self.execute_trajectory_client,
+                ready_goal,
+                'ExecuteTrajectory'
+            ) is None:
+                return self.cancel_plan_and_execute(goal_handle)
 
         self.publish_plan_feedback(goal_handle, 'planning_path', 0.50)
 
@@ -850,18 +894,37 @@ class OrchestratorURServer(Node):
 
         self.publish_plan_feedback(goal_handle, 'computing_cartesian_path', 0.60)
 
-        execute_goal = ExecuteTrajectory.Goal()
-        execute_goal.trajectory = self.compute_cartesian_path(plan_response.waypoints)
+        tool0_poses = [
+            self.create_tool0_pose(
+                *tcp_to_tool0_position((waypoint.x, waypoint.y, waypoint.z), tcp_offset)
+            )
+            for waypoint in plan_response.waypoints
+        ]
 
-        self.publish_plan_feedback(goal_handle, 'executing_path', 0.70)
+        self.publish_tool0_poses([self.create_tool0_pose(*tool0_ready)] + tool0_poses)
 
-        if not self.run_motion(
-            goal_handle,
-            self.execute_trajectory_client,
-            execute_goal,
-            'ExecuteTrajectory'
-        ):
-            return self.cancel_plan_and_execute(goal_handle)
+        path = self.compute_cartesian_path(
+            tool0_poses,
+            ready_plan.planned_trajectory if dry_run else None
+        )
+
+        self.check_joint_travel(path, 'Cartesian path')
+
+        if dry_run:
+            self.get_logger().info('dry_run: plans are valid, the robot was not moved')
+        else:
+            self.publish_plan_feedback(goal_handle, 'executing_path', 0.70)
+
+            path_goal = ExecuteTrajectory.Goal()
+            path_goal.trajectory = path
+
+            if self.run_motion(
+                goal_handle,
+                self.execute_trajectory_client,
+                path_goal,
+                'ExecuteTrajectory'
+            ) is None:
+                return self.cancel_plan_and_execute(goal_handle)
 
         self.publish_plan_feedback(goal_handle, 'done', 1.0)
 

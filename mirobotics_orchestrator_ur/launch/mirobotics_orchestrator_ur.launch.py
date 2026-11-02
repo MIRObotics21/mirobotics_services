@@ -49,13 +49,17 @@ def generate_launch_description():
             'ray_max_distance': 3.0,
             'service_timeout': 30.0,
             'publish_markers': True,
-            # TCP position [x, y, z] in base_link, inside the workspace box and reachable
-            # with the tool pointing down. Must be set before calling plan_and_execute.
+            # Ready pose with the tool pointing down, set both before plan_and_execute.
+            # Joint positions in radians: pan, lift, elbow, wrist 1, wrist 2, wrist 3.
+            'ready_joints': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            # TCP position [x, y, z] in base_link at ready_joints, inside the workspace box.
             'ready_point': [0.0, 0.0, 0.0],
             'tcp_offset': 0.1866,
             'tool_orientation': [1.0, 0.0, 0.0, 0.0],
             'speed_scaling': 0.1,
             'motion_timeout': 120.0,
+            'max_joint_travel': 3.14,
+            'dry_run': False,
         }]
     )
 

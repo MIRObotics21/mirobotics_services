@@ -442,23 +442,35 @@ up to the top of the workspace box. `approach_point` can be passed directly as `
 
 The `PlanAndExecute` action moves the TCP to an object's approach point or to a given point:
 
-1. MoveIt 2 joint move to the `ready_point` parameter with the tool pointing down
+1. MoveIt 2 joint move to the ready pose (`ready_joints` parameter) with the tool pointing down
 2. PlanPath from `ready_point` to the target
 3. MoveIt 2 Cartesian path through the waypoints with the tool pointing down
 
 Run GenerateScene first. The action needs the Universal Robots ROS 2 driver and MoveIt 2 running.
-The joint move to `ready_point` is not checked against the voxel grid, and only the TCP path is
+The joint move to the ready pose is not checked against the voxel grid, and only the TCP path is
 planned around obstacles, not the arm. Canceling the goal stops the motion.
 
 ### Parameters
 
 | Parameter | Default | Description |
 |---|---|---|
-| `ready_point` | `[0.0, 0.0, 0.0]` | TCP position `[x, y, z]` in `base_link` where the path starts. Must be set, inside the workspace box. |
+| `ready_joints` | six zeros | Ready pose joint positions in radians: shoulder pan, shoulder lift, elbow, wrist 1, wrist 2, wrist 3. Must be set. |
+| `ready_point` | `[0.0, 0.0, 0.0]` | TCP position `[x, y, z]` in `base_link` at `ready_joints`, where the path starts. Must be set, inside the workspace box. |
 | `tcp_offset` | `0.1866` | Distance from `tool0` to the TCP along the tool axis, in meters. |
 | `tool_orientation` | `[1.0, 0.0, 0.0, 0.0]` | `tool0` orientation `[x, y, z, w]` in `base_link`. The default points the tool down. |
 | `speed_scaling` | `0.1` | Fraction of the maximum speed and acceleration, up to `1.0`. |
 | `motion_timeout` | `120.0` | Maximum duration of one motion, in seconds. |
+| `max_joint_travel` | `3.14` | A plan is rejected if one joint would travel further, in radians. |
+| `dry_run` | `false` | Plan and publish everything but do not move the robot. |
+
+Every motion is planned first, its joint travel is checked and logged, and only then is it executed.
+
+### Visualization
+
+The `tool0` targets are published on `planned_tool0_poses` (`geometry_msgs/PoseArray`): the ready pose
+first, then the waypoints. In RViz add a `PoseArray` display, set Shape to `Axes` and Durability Policy
+to `Transient Local`. Red is the tool x axis, green y and blue z. With the tool pointing down, the
+blue axis points down and the TCP is `tcp_offset` further along it.
 
 ### Usage
 

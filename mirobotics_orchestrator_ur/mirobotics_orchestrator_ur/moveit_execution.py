@@ -32,12 +32,26 @@ def find_object_target(objects_3d: List[Dict], object_id: int) -> Position:
     return float(approach_point[0]), float(approach_point[1]), float(approach_point[2])
 
 
+def largest_joint_travel(joint_names: Sequence[str], points: Sequence) -> Tuple[str, float]:
+    """Return the joint with the largest range of motion in the trajectory and that range."""
+    largest_name = ''
+    largest_travel = 0.0
+
+    for index, name in enumerate(joint_names):
+        positions = [point.positions[index] for point in points]
+
+        if positions and max(positions) - min(positions) > largest_travel:
+            largest_name = name
+            largest_travel = max(positions) - min(positions)
+
+    return largest_name, largest_travel
+
+
 def rescale_trajectory(points: Sequence, speed_scaling: float) -> None:
     """
     Slow down trajectory points in place by speed_scaling (0.0 - 1.0].
 
-    GetCartesianPath of MoveIt Humble has no speed setting, its trajectories are
-    timed at full joint speed.
+    GetCartesianPath trajectories are timed at full joint speed by default.
     """
     if speed_scaling <= 0.0 or speed_scaling > 1.0:
         raise ValueError('speed_scaling must be in the range (0.0, 1.0].')

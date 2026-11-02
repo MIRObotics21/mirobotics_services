@@ -58,7 +58,7 @@ TOPICS = {
 """,
     'plan_and_execute': """\
 /plan_and_execute (mirobotics_msg/action/PlanAndExecute)
-  1. MoveIt 2 joint move to ready_point with the tool pointing down
+  1. MoveIt 2 joint move to the ready pose (ready_joints), tool pointing down
   2. plan_path from ready_point to the target
   3. MoveIt 2 Cartesian path through the waypoints, tool pointing down
 
@@ -77,7 +77,8 @@ TOPICS = {
     ros2 action send_goal /plan_and_execute mirobotics_msg/action/PlanAndExecute \\
       "{goal_point: {x: 0.21, y: 0.13, z: 0.13}}" --feedback
 
-  The joint move to ready_point is not checked against the voxel grid.
+  The joint move to the ready pose is not checked against the voxel grid.
+  RViz: PoseArray planned_tool0_poses shows the tool0 targets (Durability Transient Local).
 """,
     'parameters': """\
 Parameters (ros2 param set /orchestrator_ur_server <name> <value>)
@@ -85,11 +86,14 @@ Parameters (ros2 param set /orchestrator_ur_server <name> <value>)
   ray_max_distance   3.0    Maximum distance from the camera searched for an object in meters
   service_timeout    30.0   Maximum wait for eval_scene, capture_scene, plan_path in seconds
   publish_markers    true   Publish RViz markers of the localized objects
-  ready_point        [0.0, 0.0, 0.0]  TCP start of the path in base_link, must be set
+  ready_joints       6 zeros  Ready pose: pan, lift, elbow, wrist 1, 2, 3 in rad, must be set
+  ready_point        [0.0, 0.0, 0.0]  TCP at ready_joints in base_link, must be set
   tcp_offset         0.1866 Distance from tool0 to the TCP along the tool axis in meters
   tool_orientation   [1.0, 0.0, 0.0, 0.0]  tool0 orientation x, y, z, w, default tool down
   speed_scaling      0.1    Fraction of the maximum speed and acceleration
   motion_timeout     120.0  Maximum duration of one motion in seconds
+  max_joint_travel   3.14   A plan is rejected if one joint travels further, in radians
+  dry_run            false  Plan and publish everything but do not move the robot
 """,
 }
 
