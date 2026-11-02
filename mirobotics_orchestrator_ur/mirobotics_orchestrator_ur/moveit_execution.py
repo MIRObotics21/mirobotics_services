@@ -1,97 +1,52 @@
-import json
-from geometry_msgs.msg import Pose
+from typing import Dict, List, Optional, Sequence, Tuple
 
 
-def parse_json_path(json_path: str):
-    data = json.loads(json_path)
-    return data.get("path", [])
+Position = Tuple[float, float, float]
 
 
-def voxel_path_to_poses(
-    json_path: str,
-    fixed_orientation=None,
-    min_distance: float = 0.03,
-):
+def tcp_to_tool0_position(point: Sequence[float], tcp_offset: float) -> Position:
+    """Convert a TCP position to the tool0 position with the tool pointing straight down."""
+    return float(point[0]), float(point[1]), float(point[2]) + float(tcp_offset)
+
+
+def find_object_target(objects_3d: List[Dict], object_id: int) -> Position:
     """
-    Convert PlanPath json_path to MoveIt Cartesian waypoints.
+    Return the approach point of an object from the last GenerateScene.
 
-    Expected path row:
-        [id, x, y, z, passable]
+    Raises ValueError when the object is unknown or has no approach point.
     """
-    rows = parse_json_path(json_path)
+    obj: Optional[Dict] = next(
+        (candidate for candidate in objects_3d if candidate.get('id') == object_id),
+        None
+    )
 
-    if fixed_orientation is None:
-        fixed_orientation = {
-            "x": 1.0,
-            "y": 0.0,
-            "z": 0.0,
-            "w": 0.0,
-        }
+    if obj is None:
+        known_ids = [candidate.get('id') for candidate in objects_3d]
+        raise ValueError(f'Object {object_id} not found, last GenerateScene found {known_ids}')
 
-    poses = []
-    last_position = None
+    approach_point = obj.get('approach_point')
 
-    for row in rows:
-        if len(row) < 4:
-            continue
+    if approach_point is None:
+        raise ValueError(f'Object {object_id} has no approach point')
 
-        x = float(row[1])
-        y = float(row[2])
-        z = float(row[3]) - 0.1866
-
-        if last_position is not None:
-            dx = x - last_position[0]
-            dy = y - last_position[1]
-            dz = z - last_position[2]
-            distance = (dx * dx + dy * dy + dz * dz) ** 0.5
-
-            if distance < min_distance:
-                continue
-
-        pose = Pose()
-        pose.position.x = x
-        pose.position.y = y
-        pose.position.z = z
-
-        pose.orientation.x = fixed_orientation["x"]
-        pose.orientation.y = fixed_orientation["y"]
-        pose.orientation.z = fixed_orientation["z"]
-        pose.orientation.w = fixed_orientation["w"]
-
-        poses.append(pose)
-        last_position = (x, y, z)
-
-    return poses
+    return float(approach_point[0]), float(approach_point[1]), float(approach_point[2])
 
 
-def json_path_to_goal_pose(
-    json_path: str,
-    fixed_orientation=None,
-    tcp_z_offset: float = 0.1866,
-):
-    rows = parse_json_path(json_path)
+def rescale_trajectory(points: Sequence, speed_scaling: float) -> None:
+    """
+    Slow down trajectory points in place by speed_scaling (0.0 - 1.0].
 
-    if not rows:
-        raise ValueError("json_path contains no path rows")
+    GetCartesianPath of MoveIt Humble has no speed setting, its trajectories are
+    timed at full joint speed.
+    """
+    if speed_scaling <= 0.0 or speed_scaling > 1.0:
+        raise ValueError('speed_scaling must be in the range (0.0, 1.0].')
 
-    row = rows[-1]
+    for point in points:
+        nanoseconds = point.time_from_start.sec * 1000000000 + point.time_from_start.nanosec
+        nanoseconds = int(round(nanoseconds / speed_scaling))
 
-    if fixed_orientation is None:
-        fixed_orientation = {
-            "x": 1.0,
-            "y": 0.0,
-            "z": 0.0,
-            "w": 0.0,
-        }
-
-    pose = Pose()
-    pose.position.x = float(row[1])
-    pose.position.y = float(row[2])
-    pose.position.z = float(row[3]) - tcp_z_offset
-
-    pose.orientation.x = fixed_orientation["x"]
-    pose.orientation.y = fixed_orientation["y"]
-    pose.orientation.z = fixed_orientation["z"]
-    pose.orientation.w = fixed_orientation["w"]
-
-    return pose
+        point.time_from_start.sec = nanoseconds // 1000000000
+        point.time_from_start.nanosec = nanoseconds % 1000000000
+        point.velocities = [v * speed_scaling for v in point.velocities]
+        point.accelerations = [a * speed_scaling * speed_scaling for a in point.accelerations]

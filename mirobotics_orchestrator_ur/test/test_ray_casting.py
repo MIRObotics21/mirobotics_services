@@ -24,7 +24,7 @@ CX, CY = 320.0, 240.0
 
 
 def make_json_matrix(occupancy, min_index=MIN_INDEX, voxel_size=VOXEL_SIZE, frame_id='base_link'):
-    """Same layout as CaptureScene: rows ordered by id = (ix * ny + iy) * nz + iz."""
+    """Build a CaptureScene json_matrix, rows ordered by id = (ix * ny + iy) * nz + iz."""
     rows = []
 
     for voxel_id, index in enumerate(np.ndindex(occupancy.shape)):

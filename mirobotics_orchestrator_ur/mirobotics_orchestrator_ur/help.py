@@ -17,7 +17,7 @@ Actions:     /generate_scene   (mirobotics_msg/action/GenerateScene)
 Uses:        /eval_scene, /capture_scene, /plan_path
 RViz:        scene_object_markers (MarkerArray, Durability Transient Local)
 
-Order: generate_scene first, plan_and_execute moves within its voxel grid.
+Order: generate_scene first, then plan_and_execute. Set the ready_point parameter first.
 
 Launch (also starts mirobotics_scene_eval and mirobotics_path_planner):
   ros2 launch mirobotics_orchestrator_ur mirobotics_orchestrator_ur.launch.py \\
@@ -58,19 +58,26 @@ TOPICS = {
 """,
     'plan_and_execute': """\
 /plan_and_execute (mirobotics_msg/action/PlanAndExecute)
-  Moves the tool to a voxel of the last generate_scene with MoveIt 2.
-  Being reworked for ur_ros_rtde, the interface will change.
+  1. MoveIt 2 joint move to ready_point with the tool pointing down
+  2. plan_path from ready_point to the target
+  3. MoveIt 2 Cartesian path through the waypoints, tool pointing down
 
   Goal:
-    start_voxel_id, goal_voxel_id   voxel ids of the last generate_scene grid
+    object_id    id from the last generate_scene, target is its approach point
+    goal_point   x, y, z TCP target in the grid frame, used when object_id is -1
   Result:
     success, error_msg
   Feedback:
     current_step, progress 0.0 - 1.0
 
-  Example:
+  Examples:
     ros2 action send_goal /plan_and_execute mirobotics_msg/action/PlanAndExecute \\
-      "{start_voxel_id: 1, goal_voxel_id: 13}" --feedback
+      "{object_id: 1}" --feedback
+
+    ros2 action send_goal /plan_and_execute mirobotics_msg/action/PlanAndExecute \\
+      "{goal_point: {x: 0.21, y: 0.13, z: 0.13}}" --feedback
+
+  The joint move to ready_point is not checked against the voxel grid.
 """,
     'parameters': """\
 Parameters (ros2 param set /orchestrator_ur_server <name> <value>)
@@ -78,6 +85,11 @@ Parameters (ros2 param set /orchestrator_ur_server <name> <value>)
   ray_max_distance   3.0    Maximum distance from the camera searched for an object in meters
   service_timeout    30.0   Maximum wait for eval_scene, capture_scene, plan_path in seconds
   publish_markers    true   Publish RViz markers of the localized objects
+  ready_point        [0.0, 0.0, 0.0]  TCP start of the path in base_link, must be set
+  tcp_offset         0.1866 Distance from tool0 to the TCP along the tool axis in meters
+  tool_orientation   [1.0, 0.0, 0.0, 0.0]  tool0 orientation x, y, z, w, default tool down
+  speed_scaling      0.1    Fraction of the maximum speed and acceleration
+  motion_timeout     120.0  Maximum duration of one motion in seconds
 """,
 }
 

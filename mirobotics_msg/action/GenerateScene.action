@@ -5,7 +5,7 @@ string model_path
 # Edge length of a voxel in meters.
 float32 voxel_size
 # Also return every voxel in json_matrix "matrix". Off by default to keep the
-# result short. PlanAndExecute works either way.
+# result short.
 bool include_matrix false
 ---
 bool success

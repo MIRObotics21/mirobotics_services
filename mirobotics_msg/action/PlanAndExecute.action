@@ -1,7 +1,11 @@
-# Move the robot to a voxel of the last GenerateScene (action /plan_and_execute).
-# Voxel ids from the GenerateScene json_matrix.
-int64 start_voxel_id
-int64 goal_voxel_id
+# Move the tool to an object or a point with MoveIt 2 (action /plan_and_execute).
+# The robot moves to the ready_point parameter, then follows a PlanPath path
+# from there to the target with the tool pointing down.
+# Object id from the last GenerateScene, the target is its approach point.
+# -1 uses goal_point instead.
+int64 object_id -1
+# TCP target in the grid frame, in meters.
+geometry_msgs/Point goal_point
 ---
 bool success
 string error_msg

@@ -1,23 +1,27 @@
 import math
 import json
 import threading
+import time
 
 import rclpy
 from rclpy.node import Node
-from rclpy.action import ActionServer, ActionClient
+from rclpy.action import ActionServer, ActionClient, CancelResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from geometry_msgs.msg import Point, Pose
-from moveit_msgs.action import MoveGroup
+from moveit_msgs.action import ExecuteTrajectory, MoveGroup
 from moveit_msgs.msg import (
     Constraints,
-    PositionConstraint,
     MotionPlanRequest,
+    MoveItErrorCodes,
+    OrientationConstraint,
     PlanningOptions,
+    PositionConstraint,
 )
+from moveit_msgs.srv import GetCartesianPath
 from shape_msgs.msg import SolidPrimitive
 
 from sensor_msgs.msg import CameraInfo
@@ -33,6 +37,11 @@ from tf2_ros import (
 from mirobotics_msg.action import GenerateScene, PlanAndExecute
 from mirobotics_msg.srv import EvalScene, CaptureScene, PlanPath
 
+from mirobotics_orchestrator_ur.moveit_execution import (
+    find_object_target,
+    rescale_trajectory,
+    tcp_to_tool0_position,
+)
 from mirobotics_orchestrator_ur.ray_casting import assign_objects_to_voxels, parse_scene_grid
 
 BASE_FRAME = 'base_link'
@@ -51,10 +60,13 @@ OBJECT_COLORS = [
 ]
 
 MOVE_GROUP_ACTION = '/move_action'
+EXECUTE_TRAJECTORY_ACTION = '/execute_trajectory'
+CARTESIAN_PATH_SERVICE = '/compute_cartesian_path'
 MOVE_GROUP_NAME = 'ur_manipulator'
 MOVEIT_TARGET_LINK = 'tool0'
-TOOL0_TCP_OFFSET_Z = -0.1866
-POSITION_TOLERANCE = 0.03
+POSITION_TOLERANCE = 0.01
+ORIENTATION_TOLERANCE = 0.02
+CARTESIAN_MAX_STEP = 0.005
 
 
 class OrchestratorURServer(Node):
@@ -77,6 +89,17 @@ class OrchestratorURServer(Node):
         self.declare_parameter('service_timeout', 30.0)
         # Publish object, hit point and approach voxels for RViz after each GenerateScene.
         self.declare_parameter('publish_markers', True)
+        # PlanAndExecute: TCP position [x, y, z] in base_link reached from home with a
+        # joint move, the planned path starts here. Must be set, 0, 0, 0 means not set.
+        self.declare_parameter('ready_point', [0.0, 0.0, 0.0])
+        # PlanAndExecute: distance from tool0 to the TCP along the tool axis, in meters.
+        self.declare_parameter('tcp_offset', 0.1866)
+        # PlanAndExecute: tool0 orientation [x, y, z, w] in base_link, default is tool down.
+        self.declare_parameter('tool_orientation', [1.0, 0.0, 0.0, 0.0])
+        # PlanAndExecute: fraction of the maximum speed and acceleration, (0.0 - 1.0].
+        self.declare_parameter('speed_scaling', 0.1)
+        # PlanAndExecute: maximum duration of one motion in seconds.
+        self.declare_parameter('motion_timeout', 120.0)
 
         self.camera_info_received = False
         self.fx = None
@@ -87,8 +110,8 @@ class OrchestratorURServer(Node):
         self.image_height = None
         self.camera_frame = None
 
-        self.latest_json_matrix = ''
-        self.latest_voxel_size = None
+        self.latest_objects_3d = []
+        self.motion_lock = threading.Lock()
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -121,6 +144,12 @@ class OrchestratorURServer(Node):
             callback_group=self.client_callback_group
         )
 
+        self.cartesian_path_client = self.create_client(
+            GetCartesianPath,
+            CARTESIAN_PATH_SERVICE,
+            callback_group=self.client_callback_group
+        )
+
         # Latched, RViz receives the last scene even when started later.
         marker_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -146,13 +175,23 @@ class OrchestratorURServer(Node):
             self,
             PlanAndExecute,
             'plan_and_execute',
-            self.execute_plan_and_execute_callback
+            self.execute_plan_and_execute_callback,
+            callback_group=self.client_callback_group,
+            cancel_callback=lambda _: CancelResponse.ACCEPT
         )
 
         self.move_group_client = ActionClient(
             self,
             MoveGroup,
-            MOVE_GROUP_ACTION
+            MOVE_GROUP_ACTION,
+            callback_group=self.client_callback_group
+        )
+
+        self.execute_trajectory_client = ActionClient(
+            self,
+            ExecuteTrajectory,
+            EXECUTE_TRAJECTORY_ACTION,
+            callback_group=self.client_callback_group
         )
 
         self.get_logger().info(
@@ -531,9 +570,8 @@ class OrchestratorURServer(Node):
         result.json_matrix = result_json_matrix
         result.json_objects_3d = json_objects_3d
 
-        # PlanAndExecute looks voxels up by id, keep the full matrix
-        self.latest_json_matrix = capture_response.json_matrix
-        self.latest_voxel_size = goal.voxel_size
+        # PlanAndExecute finds its target here
+        self.latest_objects_3d = json.loads(json_objects_3d)
 
         self.publish_feedback(goal_handle, 'done', 1.0)
 
@@ -549,47 +587,6 @@ class OrchestratorURServer(Node):
         self.get_logger().info(
             f'PlanAndExecute feedback: {current_step} ({progress:.2f})'
         )
-
-    def find_voxel_by_id(self, voxel_id):
-        if not self.latest_json_matrix:
-            raise RuntimeError('No voxel matrix available. Run generate_scene first.')
-
-        data = json.loads(self.latest_json_matrix)
-
-        if not isinstance(data, dict):
-            raise RuntimeError('latest_json_matrix must be a JSON object with key "matrix"')
-
-        if 'matrix' not in data:
-            raise RuntimeError('latest_json_matrix does not contain key "matrix"')
-
-        matrix = data['matrix']
-        target_id = int(voxel_id)
-
-        if target_id < 0 or target_id >= len(matrix):
-            raise RuntimeError(
-                f'Voxel id {target_id} is outside matrix row range 0 -> {len(matrix) - 1}'
-            )
-
-        voxel = matrix[target_id]
-
-        if not isinstance(voxel, list) or len(voxel) < 5:
-            raise RuntimeError(f'Invalid voxel row at index {target_id}: {voxel}')
-
-        row_id = int(float(voxel[0]))
-
-        if row_id != target_id:
-            self.get_logger().warn(
-                f'Voxel row index {target_id} has row id {row_id}. '
-                f'Using row index as requested.'
-            )
-
-        return {
-            'id': row_id,
-            'x': float(voxel[1]),
-            'y': float(voxel[2]),
-            'z': float(voxel[3]),
-            'passable': float(voxel[4]),
-        }
 
     def create_tool0_position_constraint(self, x, y, z):
         constraint = PositionConstraint()
@@ -616,9 +613,28 @@ class OrchestratorURServer(Node):
 
         return constraint
 
+    def create_tool0_orientation_constraint(self):
+        tool_orientation = self.get_parameter('tool_orientation').value
+
+        constraint = OrientationConstraint()
+        constraint.header.frame_id = BASE_FRAME
+        constraint.link_name = MOVEIT_TARGET_LINK
+        constraint.orientation.x = float(tool_orientation[0])
+        constraint.orientation.y = float(tool_orientation[1])
+        constraint.orientation.z = float(tool_orientation[2])
+        constraint.orientation.w = float(tool_orientation[3])
+        constraint.absolute_x_axis_tolerance = ORIENTATION_TOLERANCE
+        constraint.absolute_y_axis_tolerance = ORIENTATION_TOLERANCE
+        constraint.absolute_z_axis_tolerance = ORIENTATION_TOLERANCE
+        constraint.weight = 1.0
+
+        return constraint
+
     def create_move_group_goal(self, tool0_x, tool0_y, tool0_z):
+        speed_scaling = float(self.get_parameter('speed_scaling').value)
+
         constraints = Constraints()
-        constraints.name = 'tool0_position_only_goal'
+        constraints.name = 'tool0_pose_goal'
         constraints.position_constraints.append(
             self.create_tool0_position_constraint(
                 tool0_x,
@@ -626,20 +642,22 @@ class OrchestratorURServer(Node):
                 tool0_z
             )
         )
+        constraints.orientation_constraints.append(
+            self.create_tool0_orientation_constraint()
+        )
 
         request = MotionPlanRequest()
         request.group_name = MOVE_GROUP_NAME
         request.num_planning_attempts = 10
         request.allowed_planning_time = 8.0
-        request.max_velocity_scaling_factor = 0.2
-        request.max_acceleration_scaling_factor = 0.2
+        request.max_velocity_scaling_factor = speed_scaling
+        request.max_acceleration_scaling_factor = speed_scaling
         request.goal_constraints.append(constraints)
 
         planning_options = PlanningOptions()
         planning_options.plan_only = False
         planning_options.look_around = False
-        planning_options.replan = True
-        planning_options.replan_attempts = 3
+        planning_options.replan = False
 
         goal_msg = MoveGroup.Goal()
         goal_msg.request = request
@@ -647,106 +665,219 @@ class OrchestratorURServer(Node):
 
         return goal_msg
 
-    async def execute_plan_and_execute_callback(self, goal_handle):
-        self.get_logger().info('PlanAndExecute action goal received')
+    def wait_for_future(self, future, timeout_sec, description):
+        """Block until the future is done, the result arrives on another executor thread."""
+        done = threading.Event()
+        future.add_done_callback(lambda _: done.set())
+
+        if not done.wait(timeout_sec):
+            raise TimeoutError(f'No {description} within {timeout_sec:.1f} s')
+
+        return future.result()
+
+    def run_motion(self, goal_handle, client, motion_goal, name):
+        """
+        Send a motion goal to MoveIt and wait until it finishes.
+
+        Returns False when PlanAndExecute was canceled, the motion is then canceled too.
+        Raises on timeout and on any MoveIt error.
+        """
+        if not client.wait_for_server(timeout_sec=10.0):
+            raise RuntimeError(f'{name} action server not available')
+
+        motion_handle = self.wait_for_future(
+            client.send_goal_async(motion_goal), 10.0, f'{name} goal response'
+        )
+
+        if not motion_handle.accepted:
+            raise RuntimeError(f'{name} goal was rejected')
+
+        result_future = motion_handle.get_result_async()
+        done = threading.Event()
+        result_future.add_done_callback(lambda _: done.set())
+
+        timeout_sec = float(self.get_parameter('motion_timeout').value)
+        deadline = time.monotonic() + timeout_sec
+
+        while not done.wait(0.1):
+            if goal_handle.is_cancel_requested:
+                motion_handle.cancel_goal_async()
+                done.wait(5.0)
+                return False
+
+            if time.monotonic() > deadline:
+                motion_handle.cancel_goal_async()
+                raise TimeoutError(f'{name} did not finish within {timeout_sec:.1f} s')
+
+        error_code = result_future.result().result.error_code.val
+
+        if error_code != MoveItErrorCodes.SUCCESS:
+            raise RuntimeError(f'{name} failed with MoveIt error code {error_code}')
+
+        return True
+
+    def resolve_plan_target(self, goal):
+        if goal.object_id >= 0:
+            return find_object_target(self.latest_objects_3d, goal.object_id)
+
+        target = (goal.goal_point.x, goal.goal_point.y, goal.goal_point.z)
+
+        if not any(target):
+            raise ValueError('Set object_id or goal_point')
+
+        return target
+
+    def compute_cartesian_path(self, waypoints):
+        """Return a slowed down MoveIt trajectory through the TCP waypoints, tool pointing down."""
+        tcp_offset = float(self.get_parameter('tcp_offset').value)
+        tool_orientation = self.get_parameter('tool_orientation').value
+        service_timeout = float(self.get_parameter('service_timeout').value)
+
+        if not self.cartesian_path_client.wait_for_service(timeout_sec=5.0):
+            raise RuntimeError(f'Service not available: {CARTESIAN_PATH_SERVICE}')
+
+        request = GetCartesianPath.Request()
+        request.header.frame_id = BASE_FRAME
+        request.start_state.is_diff = True
+        request.group_name = MOVE_GROUP_NAME
+        request.link_name = MOVEIT_TARGET_LINK
+        request.max_step = CARTESIAN_MAX_STEP
+        request.jump_threshold = 0.0
+        request.avoid_collisions = True
+
+        for waypoint in waypoints:
+            x, y, z = tcp_to_tool0_position((waypoint.x, waypoint.y, waypoint.z), tcp_offset)
+
+            pose = Pose()
+            pose.position.x = x
+            pose.position.y = y
+            pose.position.z = z
+            pose.orientation.x = float(tool_orientation[0])
+            pose.orientation.y = float(tool_orientation[1])
+            pose.orientation.z = float(tool_orientation[2])
+            pose.orientation.w = float(tool_orientation[3])
+            request.waypoints.append(pose)
+
+        response = self.call_service(self.cartesian_path_client, request, service_timeout)
+
+        if response.error_code.val != MoveItErrorCodes.SUCCESS:
+            raise RuntimeError(f'Cartesian path failed with error code {response.error_code.val}')
+
+        if response.fraction < 0.999:
+            raise RuntimeError(
+                f'Cartesian path covers only {response.fraction * 100.0:.1f} % of the waypoints'
+            )
+
+        rescale_trajectory(
+            response.solution.joint_trajectory.points,
+            float(self.get_parameter('speed_scaling').value)
+        )
+
+        return response.solution
+
+    def abort_plan_and_execute(self, goal_handle, error_msg):
+        self.get_logger().error(f'PlanAndExecute failed: {error_msg}')
 
         result = PlanAndExecute.Result()
-        goal = goal_handle.request
+        result.success = False
+        result.error_msg = error_msg
+
+        goal_handle.abort()
+        return result
+
+    def cancel_plan_and_execute(self, goal_handle):
+        self.get_logger().info('PlanAndExecute canceled')
+
+        result = PlanAndExecute.Result()
+        result.success = False
+        result.error_msg = 'Canceled'
+
+        goal_handle.canceled()
+        return result
+
+    def execute_plan_and_execute_callback(self, goal_handle):
+        self.get_logger().info('PlanAndExecute action goal received')
+
+        if not self.motion_lock.acquire(blocking=False):
+            return self.abort_plan_and_execute(goal_handle, 'Another motion is running')
 
         try:
-            self.publish_plan_feedback(goal_handle, 'checking_voxel_matrix', 0.05)
-
-            start_voxel = self.find_voxel_by_id(goal.start_voxel_id)
-            goal_voxel = self.find_voxel_by_id(goal.goal_voxel_id)
-
-            if start_voxel['passable'] <= 0.0:
-                result.success = False
-                result.error_msg = f'Start voxel {goal.start_voxel_id} is not passable'
-                goal_handle.abort()
-                return result
-
-            if goal_voxel['passable'] <= 0.0:
-                result.success = False
-                result.error_msg = f'Goal voxel {goal.goal_voxel_id} is not passable'
-                goal_handle.abort()
-                return result
-
-            self.publish_plan_feedback(goal_handle, 'creating_tool0_goal', 0.20)
-
-            tool0_x = goal_voxel['x']
-            tool0_y = goal_voxel['y']
-            tool0_z = goal_voxel['z'] - TOOL0_TCP_OFFSET_Z
-
-            self.get_logger().info(
-                f'Goal voxel center: '
-                f'x={goal_voxel["x"]:.3f}, '
-                f'y={goal_voxel["y"]:.3f}, '
-                f'z={goal_voxel["z"]:.3f}'
-            )
-
-            self.get_logger().info(
-                f'Tool0 target with TCP offset: '
-                f'x={tool0_x:.3f}, y={tool0_y:.3f}, z={tool0_z:.3f}'
-            )
-
-            self.publish_plan_feedback(goal_handle, 'waiting_for_move_group', 0.30)
-
-            if not self.move_group_client.wait_for_server(timeout_sec=10.0):
-                result.success = False
-                result.error_msg = f'MoveGroup action server not available: {MOVE_GROUP_ACTION}'
-                goal_handle.abort()
-                return result
-
-            move_goal = self.create_move_group_goal(
-                tool0_x,
-                tool0_y,
-                tool0_z
-            )
-
-            self.publish_plan_feedback(goal_handle, 'sending_goal_to_moveit', 0.45)
-
-            send_goal_future = self.move_group_client.send_goal_async(move_goal)
-            move_goal_handle = await send_goal_future
-
-            if not move_goal_handle.accepted:
-                result.success = False
-                result.error_msg = 'MoveGroup goal was rejected'
-                goal_handle.abort()
-                return result
-
-            self.publish_plan_feedback(goal_handle, 'planning_and_executing', 0.65)
-
-            move_result_future = move_goal_handle.get_result_async()
-            move_result_response = await move_result_future
-
-            move_result = move_result_response.result
-            error_code = move_result.error_code.val
-
-            if error_code != 1:
-                result.success = False
-                result.error_msg = f'MoveGroup failed with error code: {error_code}'
-                goal_handle.abort()
-                return result
-
-            self.publish_plan_feedback(goal_handle, 'done', 1.0)
-
-            result.success = True
-            result.error_msg = ''
-            goal_handle.succeed()
-            return result
-
+            return self.run_plan_and_execute(goal_handle)
         except Exception as exc:
-            result.success = False
-            result.error_msg = f'PlanAndExecute failed: {str(exc)}'
-            goal_handle.abort()
-            return result
+            return self.abort_plan_and_execute(goal_handle, str(exc))
+        finally:
+            self.motion_lock.release()
+
+    def run_plan_and_execute(self, goal_handle):
+        goal = goal_handle.request
+        tcp_offset = float(self.get_parameter('tcp_offset').value)
+        service_timeout = float(self.get_parameter('service_timeout').value)
+        ready_point = list(self.get_parameter('ready_point').value)
+
+        if not any(ready_point):
+            raise ValueError('Set the ready_point parameter')
+
+        target = self.resolve_plan_target(goal)
+        self.get_logger().info(f'Ready point: {ready_point}, target: {target}')
+
+        self.publish_plan_feedback(goal_handle, 'moving_to_ready_point', 0.10)
+
+        tool0_ready = tcp_to_tool0_position(ready_point, tcp_offset)
+
+        if not self.run_motion(
+            goal_handle,
+            self.move_group_client,
+            self.create_move_group_goal(*tool0_ready),
+            'MoveGroup'
+        ):
+            return self.cancel_plan_and_execute(goal_handle)
+
+        self.publish_plan_feedback(goal_handle, 'planning_path', 0.50)
+
+        if not self.plan_path_client.wait_for_service(timeout_sec=5.0):
+            raise RuntimeError(f'Service not available: {PLAN_PATH_SERVICE}')
+
+        plan_request = PlanPath.Request()
+        plan_request.start_point = Point(
+            x=float(ready_point[0]), y=float(ready_point[1]), z=float(ready_point[2])
+        )
+        plan_request.goal_point = Point(x=target[0], y=target[1], z=target[2])
+
+        plan_response = self.call_service(self.plan_path_client, plan_request, service_timeout)
+
+        if not plan_response.success:
+            raise RuntimeError(f'PlanPath failed: {plan_response.error_msg}')
+
+        self.publish_plan_feedback(goal_handle, 'computing_cartesian_path', 0.60)
+
+        execute_goal = ExecuteTrajectory.Goal()
+        execute_goal.trajectory = self.compute_cartesian_path(plan_response.waypoints)
+
+        self.publish_plan_feedback(goal_handle, 'executing_path', 0.70)
+
+        if not self.run_motion(
+            goal_handle,
+            self.execute_trajectory_client,
+            execute_goal,
+            'ExecuteTrajectory'
+        ):
+            return self.cancel_plan_and_execute(goal_handle)
+
+        self.publish_plan_feedback(goal_handle, 'done', 1.0)
+
+        result = PlanAndExecute.Result()
+        result.success = True
+        result.error_msg = ''
+
+        goal_handle.succeed()
+        return result
 
 
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = OrchestratorURServer()
-    # Several threads: GenerateScene blocks while waiting for service responses
-    executor = MultiThreadedExecutor()
+    # Several threads: action callbacks block while waiting for responses of services and motions
+    executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
 
     try:

@@ -49,6 +49,13 @@ def generate_launch_description():
             'ray_max_distance': 3.0,
             'service_timeout': 30.0,
             'publish_markers': True,
+            # TCP position [x, y, z] in base_link, inside the workspace box and reachable
+            # with the tool pointing down. Must be set before calling plan_and_execute.
+            'ready_point': [0.0, 0.0, 0.0],
+            'tcp_offset': 0.1866,
+            'tool_orientation': [1.0, 0.0, 0.0, 0.0],
+            'speed_scaling': 0.1,
+            'motion_timeout': 120.0,
         }]
     )
 

@@ -440,21 +440,44 @@ up to the top of the workspace box. `approach_point` can be passed directly as `
 
 # PlanAndExecute Action
 
-The `PlanAndExecute` action performs:
+The `PlanAndExecute` action moves the TCP to an object's approach point or to a given point:
 
-1. voxel path planning
-2. target pose generation
-3. MoveIt 2 planning
-4. robot trajectory execution
+1. MoveIt 2 joint move to the `ready_point` parameter with the tool pointing down
+2. PlanPath from `ready_point` to the target
+3. MoveIt 2 Cartesian path through the waypoints with the tool pointing down
+
+Run GenerateScene first. The action needs the Universal Robots ROS 2 driver and MoveIt 2 running.
+The joint move to `ready_point` is not checked against the voxel grid, and only the TCP path is
+planned around obstacles, not the arm. Canceling the goal stops the motion.
+
+### Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `ready_point` | `[0.0, 0.0, 0.0]` | TCP position `[x, y, z]` in `base_link` where the path starts. Must be set, inside the workspace box. |
+| `tcp_offset` | `0.1866` | Distance from `tool0` to the TCP along the tool axis, in meters. |
+| `tool_orientation` | `[1.0, 0.0, 0.0, 0.0]` | `tool0` orientation `[x, y, z, w]` in `base_link`. The default points the tool down. |
+| `speed_scaling` | `0.1` | Fraction of the maximum speed and acceleration, up to `1.0`. |
+| `motion_timeout` | `120.0` | Maximum duration of one motion, in seconds. |
 
 ### Usage
+
+To an object from the last GenerateScene:
 
 ```bash
 ros2 action send_goal \
 /plan_and_execute \
 mirobotics_msg/action/PlanAndExecute \
-"{start_voxel_id: 1,
-goal_voxel_id: 13}" --feedback
+"{object_id: 1}" --feedback
+```
+
+To a point:
+
+```bash
+ros2 action send_goal \
+/plan_and_execute \
+mirobotics_msg/action/PlanAndExecute \
+"{goal_point: {x: 0.21, y: 0.13, z: 0.13}}" --feedback
 ```
 
 ### Example Output
