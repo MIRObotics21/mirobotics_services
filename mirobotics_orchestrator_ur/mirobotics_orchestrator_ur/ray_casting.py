@@ -157,10 +157,9 @@ def cast_ray(
     Every voxel the ray passes through is visited exactly once, so no voxel is
     skipped regardless of its size.
 
-    Returns:
-        index of the first occupied voxel and the distance from origin to the
-        point where the ray enters it, or None when nothing is hit within
-        max_distance
+    Returns the index of the first occupied voxel and the distance from origin
+    to the point where the ray enters it, or None when nothing is hit within
+    max_distance.
     """
     origin = np.asarray(origin, dtype=np.float64)
     direction = normalize_vector(direction)

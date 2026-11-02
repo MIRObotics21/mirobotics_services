@@ -58,9 +58,8 @@ def compute_grid(
     voxel centers lie at (index + 0.5) * voxel_size and ids do not depend on
     the captured points.
 
-    Returns:
-        min_index: integer index of the first voxel on each axis
-        shape: number of voxels on each axis (nx, ny, nz)
+    Returns min_index, the integer index of the first voxel on each axis, and
+    shape, the number of voxels on each axis (nx, ny, nz).
     """
     if voxel_size <= 0.0:
         raise ValueError('voxel_size must be greater than 0.')

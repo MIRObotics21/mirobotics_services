@@ -192,7 +192,7 @@ class OrchestratorURServer(Node):
         The returned matrix transforms vectors from source frame to target frame
         when using a TF transform target <- source.
         """
-        norm =math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+        norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
 
         if norm == 0.0:
             raise ValueError('Invalid zero-length quaternion')
@@ -244,9 +244,9 @@ class OrchestratorURServer(Node):
         """
         Look up the camera optical frame in target_frame.
 
-        Returns:
-            camera_origin: [x, y, z] of the camera optical frame in target_frame
-            rotation_target_camera: 3x3 rotation matrix camera -> target_frame
+        Returns camera_origin, the [x, y, z] of the camera optical frame in
+        target_frame, and rotation_target_camera, the 3x3 rotation matrix
+        camera -> target_frame.
         """
         if self.camera_frame is None:
             raise RuntimeError('Camera frame is unknown because CameraInfo was not received')

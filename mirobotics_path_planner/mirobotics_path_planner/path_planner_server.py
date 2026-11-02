@@ -481,10 +481,9 @@ class PathPlannerServer(Node):
         """
         Resolve a start or goal given by voxel id (id >= 0) or by point (id == -1).
 
-        Returns:
-            grid index of the free voxel to plan from or to
-            requested point, None when the voxel id was used
-            True if the point was occupied and moved to the nearest free voxel
+        Returns the grid index of the free voxel to plan from or to, the requested
+        point (None when the voxel id was used) and whether the point was occupied
+        and moved to the nearest free voxel.
         """
         if voxel_id >= 0:
             index = id_to_grid_index(voxel_id, planner.shape)
