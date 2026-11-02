@@ -18,9 +18,7 @@ _TUBE_OFFSETS = np.array(list(itertools.product((-0.25, 0.25), repeat=3)))
 
 
 def dilate_cube(occupancy: np.ndarray, radius: int) -> np.ndarray:
-    """
-    Mark every voxel inside a (2 * radius + 1)^3 cube around an occupied voxel.
-    """
+    """Mark every voxel inside a (2 * radius + 1)^3 cube around an occupied voxel."""
     dilated = occupancy.astype(bool, copy=True)
 
     for axis in range(3):

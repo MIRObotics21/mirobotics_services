@@ -191,9 +191,7 @@ class PathPlannerServer(Node):
             source_frame: str,
             target_frame: str,
     ) -> np.ndarray:
-        """
-        Transform an N x 3 XYZ matrix from source_frame into target_frame.
-        """
+        """Transform an N x 3 XYZ matrix from source_frame into target_frame."""
         if xyz_matrix.size == 0:
             return xyz_matrix
 
@@ -231,9 +229,7 @@ class PathPlannerServer(Node):
             workspace_max: list,
             frame_id: str,
     ) -> None:
-        """
-        Publish occupied voxels as cubes and the workspace box as lines.
-        """
+        """Publish occupied voxels as cubes and the workspace box as lines."""
         occupied = Marker()
         occupied.header.frame_id = frame_id
         occupied.ns = 'occupied_voxels'
@@ -527,9 +523,7 @@ class PathPlannerServer(Node):
             voxel_size: float,
             frame_id: str,
     ) -> None:
-        """
-        Publish the full voxel path as a thin line and the waypoints as a thick line with spheres.
-        """
+        """Publish the voxel path as a thin line and the waypoints as a thick line with spheres."""
         markers = []
 
         for marker_id, (ns, points, width, color) in enumerate((
