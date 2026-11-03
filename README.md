@@ -100,6 +100,7 @@ ROS 2 interfaces package containing:
 * `EvalScene.srv`
 * `CaptureScene.srv`
 * `PlanPath.srv`
+* `CheckPoints.srv`
 
 ### Actions
 
@@ -374,7 +375,7 @@ The `GenerateScene` action performs:
 |---|---|---|
 | `camera_info_topic` | `/camera/camera/color/camera_info` | CameraInfo of the RGB image used by EvalScene. |
 | `ray_max_distance` | `3.0` | Maximum distance from the camera searched for an object, in meters. |
-| `service_timeout` | `30.0` | Maximum time to wait for an EvalScene, CaptureScene or PlanPath response, in seconds. |
+| `service_timeout` | `30.0` | Maximum time to wait for an EvalScene, CaptureScene or CheckPoints response, in seconds. |
 | `publish_markers` | `true` | Publishes the localized objects for RViz after each GenerateScene. |
 
 ### Visualization
@@ -426,7 +427,7 @@ json_objects_3d:
 ```
 
 Like CaptureScene, `json_matrix` lists every voxel only with `include_matrix: true` in the goal.
-PlanAndExecute works either way, the orchestrator always keeps the full grid.
+PlanAndExecute works either way.
 
 * `object_voxel_id`, `object_point`: first occupied voxel hit by the ray and its center
 * `hit_point`: exact point where the ray enters that voxel
@@ -438,39 +439,51 @@ up to the top of the workspace box. `approach_point` can be passed directly as `
 
 ---
 
+# CheckPoints Service
+
+CheckPoints tells which points lie in an occupied voxel of the last CaptureScene. Points outside
+the voxel grid count as free. PlanAndExecute uses it to check the TCP along a planned motion.
+
+```bash
+ros2 service call /check_points mirobotics_msg/srv/CheckPoints "{points: [{x: 0.21, y: 0.13, z: 0.13}]}"
+```
+
+---
+
 # PlanAndExecute Action
 
-The `PlanAndExecute` action moves the TCP to an object's approach point or to a given point:
+The `PlanAndExecute` action moves the TCP `hover_height` above an object, or to a given point,
+with the fixed orientation `tcp_rotation`:
 
-1. MoveIt 2 joint move to the ready pose (`ready_joints` parameter) with the tool pointing down
-2. PlanPath from `ready_point` to the target
-3. MoveIt 2 Cartesian path through the waypoints with the tool pointing down
+1. the TCP target is `hover_height` above the top of the object (the bottom of its approach voxel)
+2. the joints are computed with UR3 inverse kinematics, always in the same arm configuration:
+   reaching forward toward the target, elbow up, tool pointing down
+3. MoveIt 2 plans the joint move, the plan is rejected if one joint travels more than `max_joint_travel`
+4. the TCP along the plan is checked against the voxel grid with CheckPoints, voxels the TCP starts
+   in (the robot itself) are ignored
+5. the move is executed, unless `dry_run` is set
 
 Run GenerateScene first. The action needs the Universal Robots ROS 2 driver and MoveIt 2 running.
-The joint move to the ready pose is not checked against the voxel grid, and only the TCP path is
-planned around obstacles, not the arm. Canceling the goal stops the motion.
+Only the TCP is checked against the voxel grid, not the arm. Canceling the goal stops the motion.
 
 ### Parameters
 
 | Parameter | Default | Description |
 |---|---|---|
-| `ready_joints` | six zeros | Ready pose joint positions in radians: shoulder pan, shoulder lift, elbow, wrist 1, wrist 2, wrist 3. Must be set. |
-| `ready_point` | `[0.0, 0.0, 0.0]` | TCP position `[x, y, z]` in `base_link` at `ready_joints`, where the path starts. Must be set, inside the workspace box. |
+| `hover_height` | `0.05` | Height of the TCP above the top of the object, in meters. |
 | `tcp_offset` | `0.1866` | Distance from `tool0` to the TCP along the tool axis, in meters. |
-| `tool_orientation` | `[1.0, 0.0, 0.0, 0.0]` | `tool0` orientation `[x, y, z, w]` in `base_link`. The default points the tool down. |
+| `tcp_rotation` | `[pi, 0.0, 0.0]` | Fixed orientation `rx, ry, rz` in radians as on the pendant (Base feature). The default points the tool down. |
 | `speed_scaling` | `0.1` | Fraction of the maximum speed and acceleration, up to `1.0`. |
 | `motion_timeout` | `120.0` | Maximum duration of one motion, in seconds. |
 | `max_joint_travel` | `3.14` | A plan is rejected if one joint would travel further, in radians. |
-| `dry_run` | `false` | Plan and publish everything but do not move the robot. |
-
-Every motion is planned first, its joint travel is checked and logged, and only then is it executed.
+| `dry_run` | `false` | Plan, check and publish everything but do not move the robot. |
 
 ### Visualization
 
-The `tool0` targets are published on `planned_tool0_poses` (`geometry_msgs/PoseArray`): the ready pose
-first, then the waypoints. In RViz add a `PoseArray` display, set Shape to `Axes` and Durability Policy
-to `Transient Local`. Red is the tool x axis, green y and blue z. With the tool pointing down, the
-blue axis points down and the TCP is `tcp_offset` further along it.
+The `tool0` target is published on `planned_tool0_poses` (`geometry_msgs/PoseArray`). In RViz add a
+`PoseArray` display, set Shape to `Axes` and Durability Policy to `Transient Local`. Red is the tool
+x axis, green y and blue z. With the tool pointing down, the blue axis points down and the TCP is
+`tcp_offset` further along it.
 
 ### Usage
 
@@ -489,7 +502,7 @@ To a point:
 ros2 action send_goal \
 /plan_and_execute \
 mirobotics_msg/action/PlanAndExecute \
-"{goal_point: {x: 0.21, y: 0.13, z: 0.13}}" --feedback
+"{goal_point: {x: 0.3, y: -0.1, z: 0.15}}" --feedback
 ```
 
 ### Example Output
