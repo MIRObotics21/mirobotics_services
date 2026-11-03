@@ -1,0 +1,8 @@
+# Points in the planning frame of the captured scene, in meters.
+geometry_msgs/Point[] points
+---
+bool success
+string error_msg
+# One value per point, true when the point lies in an occupied voxel.
+# Points outside the voxel grid count as free.
+bool[] occupied

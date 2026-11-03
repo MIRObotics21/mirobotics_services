@@ -14,10 +14,10 @@ Node:        orchestrator_ur_server
 Subscribes:  camera_info_topic (sensor_msgs/CameraInfo) for the RGB intrinsics
 Actions:     /generate_scene   (mirobotics_msg/action/GenerateScene)
              /plan_and_execute (mirobotics_msg/action/PlanAndExecute)
-Uses:        /eval_scene, /capture_scene, /plan_path
+Uses:        /eval_scene, /capture_scene, /check_points, MoveIt 2
 RViz:        scene_object_markers (MarkerArray, Durability Transient Local)
 
-Order: generate_scene first, then plan_and_execute. Set the ready_point parameter first.
+Order: generate_scene first, then plan_and_execute.
 
 Launch (also starts mirobotics_scene_eval and mirobotics_path_planner):
   ros2 launch mirobotics_orchestrator_ur mirobotics_orchestrator_ur.launch.py \\
@@ -58,13 +58,15 @@ TOPICS = {
 """,
     'plan_and_execute': """\
 /plan_and_execute (mirobotics_msg/action/PlanAndExecute)
-  1. MoveIt 2 joint move to the ready pose (ready_joints), tool pointing down
-  2. plan_path from ready_point to the target
-  3. MoveIt 2 Cartesian path through the waypoints, tool pointing down
+  1. TCP target: hover_height above the object top, orientation tcp_rotation
+  2. joints of the target by UR3 inverse kinematics, always the same arm configuration
+  3. MoveIt 2 plans the joint move, the joint travel is checked
+  4. the TCP along the plan is checked against the voxel grid (check_points)
+  5. the move is executed unless dry_run
 
   Goal:
-    object_id    id from the last generate_scene, target is its approach point
-    goal_point   x, y, z TCP target in the grid frame, used when object_id is -1
+    object_id    id from the last generate_scene, target is hover_height above it
+    goal_point   x, y, z TCP target in base_link, used when object_id is -1
   Result:
     success, error_msg
   Feedback:
@@ -77,19 +79,18 @@ TOPICS = {
     ros2 action send_goal /plan_and_execute mirobotics_msg/action/PlanAndExecute \\
       "{goal_point: {x: 0.21, y: 0.13, z: 0.13}}" --feedback
 
-  The joint move to the ready pose is not checked against the voxel grid.
-  RViz: PoseArray planned_tool0_poses shows the tool0 targets (Durability Transient Local).
+  Only the TCP is checked against the voxel grid, not the arm.
+  RViz: PoseArray planned_tool0_poses shows the tool0 target (Durability Transient Local).
 """,
     'parameters': """\
 Parameters (ros2 param set /orchestrator_ur_server <name> <value>)
   camera_info_topic  /camera/camera/color/camera_info  CameraInfo of the RGB image
   ray_max_distance   3.0    Maximum distance from the camera searched for an object in meters
-  service_timeout    30.0   Maximum wait for eval_scene, capture_scene, plan_path in seconds
+  service_timeout    30.0   Maximum wait for eval_scene, capture_scene, check_points in seconds
   publish_markers    true   Publish RViz markers of the localized objects
-  ready_joints       6 zeros  Ready pose: pan, lift, elbow, wrist 1, 2, 3 in rad, must be set
-  ready_point        [0.0, 0.0, 0.0]  TCP at ready_joints in base_link, must be set
+  hover_height       0.05   Height of the TCP above the top of the object in meters
   tcp_offset         0.1866 Distance from tool0 to the TCP along the tool axis in meters
-  tool_orientation   [1.0, 0.0, 0.0, 0.0]  tool0 orientation x, y, z, w, default tool down
+  tcp_rotation       [pi, 0.0, 0.0]  Fixed rx, ry, rz as on the pendant, default tool down
   speed_scaling      0.1    Fraction of the maximum speed and acceleration
   motion_timeout     120.0  Maximum duration of one motion in seconds
   max_joint_travel   3.14   A plan is rejected if one joint travels further, in radians

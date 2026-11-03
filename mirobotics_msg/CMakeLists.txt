@@ -17,6 +17,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/EvalScene.srv"
   "srv/PlanPath.srv"
   "srv/CaptureScene.srv"
+  "srv/CheckPoints.srv"
   "action/GenerateScene.action"
   "action/PlanAndExecute.action"
   DEPENDENCIES geometry_msgs

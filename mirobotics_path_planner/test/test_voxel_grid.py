@@ -11,6 +11,7 @@ from mirobotics_path_planner.voxel_grid import (
     id_to_grid_index,
     occupancy_to_matrix,
     point_to_grid_index,
+    points_occupied,
     quaternion_to_rotation_matrix,
     transform_points,
     voxelize,
@@ -19,6 +20,21 @@ from mirobotics_path_planner.voxel_grid import (
 
 WORKSPACE_MIN = [-0.5, -0.5, 0.0]
 WORKSPACE_MAX = [0.5, 0.5, 0.6]
+
+
+def test_points_occupied_treats_outside_of_the_grid_as_free():
+    min_index, shape = compute_grid(WORKSPACE_MIN, WORKSPACE_MAX, 0.1)
+    occupancy = np.zeros(shape, dtype=bool)
+    occupancy[7, 2, 1] = True
+
+    points = [
+        (0.25, -0.25, 0.15),
+        (0.25, -0.25, 0.25),
+        (0.25, -0.25, 0.69),
+        (-0.55, 0.0, 0.1),
+    ]
+
+    assert points_occupied(points, occupancy, min_index, 0.1) == [True, False, False, False]
 
 
 def test_compute_grid_is_fixed_and_aligned():

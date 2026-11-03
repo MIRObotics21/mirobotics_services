@@ -20,7 +20,6 @@ from moveit_msgs.msg import (
     MoveItErrorCodes,
     PlanningOptions,
 )
-from moveit_msgs.srv import GetCartesianPath
 
 from sensor_msgs.msg import CameraInfo
 from visualization_msgs.msg import Marker, MarkerArray
@@ -33,20 +32,28 @@ from tf2_ros import (
 )
 
 from mirobotics_msg.action import GenerateScene, PlanAndExecute
-from mirobotics_msg.srv import EvalScene, CaptureScene, PlanPath
+from mirobotics_msg.srv import EvalScene, CaptureScene, CheckPoints
 
 from mirobotics_orchestrator_ur.moveit_execution import (
     find_object_target,
+    first_blocked_sample,
+    hover_point,
     largest_joint_travel,
-    rescale_trajectory,
-    tcp_to_tool0_position,
+    sample_tcp_path,
 )
 from mirobotics_orchestrator_ur.ray_casting import assign_objects_to_voxels, parse_scene_grid
+from mirobotics_orchestrator_ur.ur_kinematics import (
+    inverse_kinematics,
+    pendant_to_tool0_rotation,
+    rotation_matrix_to_quaternion,
+    tool0_position,
+    UR_JOINT_NAMES,
+)
 
 BASE_FRAME = 'base_link'
 SCENE_EVAL_SERVICE = '/eval_scene'
 CAPTURE_SCENE_SERVICE = '/capture_scene'
-PLAN_PATH_SERVICE = '/plan_path'
+CHECK_POINTS_SERVICE = '/check_points'
 
 # Marker colors per object type, assigned in order of first appearance
 OBJECT_COLORS = [
@@ -60,21 +67,8 @@ OBJECT_COLORS = [
 
 MOVE_GROUP_ACTION = '/move_action'
 EXECUTE_TRAJECTORY_ACTION = '/execute_trajectory'
-CARTESIAN_PATH_SERVICE = '/compute_cartesian_path'
 MOVE_GROUP_NAME = 'ur_manipulator'
-MOVEIT_TARGET_LINK = 'tool0'
-UR_JOINT_NAMES = [
-    'shoulder_pan_joint',
-    'shoulder_lift_joint',
-    'elbow_joint',
-    'wrist_1_joint',
-    'wrist_2_joint',
-    'wrist_3_joint',
-]
 JOINT_TOLERANCE = 0.01
-CARTESIAN_MAX_STEP = 0.005
-# Largest joint change between two Cartesian path steps in radians, stops the path at a flip
-CARTESIAN_REVOLUTE_JUMP = 0.5
 
 
 class OrchestratorURServer(Node):
@@ -93,20 +87,17 @@ class OrchestratorURServer(Node):
 
         # Maximum distance from the camera searched for an object, in meters.
         self.declare_parameter('ray_max_distance', 3.0)
-        # Maximum time to wait for a response of EvalScene, CaptureScene and PlanPath, in seconds.
+        # Maximum time to wait for a response of EvalScene, CaptureScene and CheckPoints, in
+        # seconds.
         self.declare_parameter('service_timeout', 30.0)
         # Publish object, hit point and approach voxels for RViz after each GenerateScene.
         self.declare_parameter('publish_markers', True)
-        # PlanAndExecute: joint positions in radians, in the order of UR_JOINT_NAMES, of the
-        # ready pose with the tool pointing down. Must be set, all zeros means not set.
-        self.declare_parameter('ready_joints', [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-        # PlanAndExecute: TCP position [x, y, z] in base_link at ready_joints, the planned
-        # path starts here. Must be set, 0, 0, 0 means not set.
-        self.declare_parameter('ready_point', [0.0, 0.0, 0.0])
+        # PlanAndExecute: height of the TCP above the top of the object, in meters.
+        self.declare_parameter('hover_height', 0.05)
         # PlanAndExecute: distance from tool0 to the TCP along the tool axis, in meters.
         self.declare_parameter('tcp_offset', 0.1866)
-        # PlanAndExecute: tool0 orientation [x, y, z, w] in base_link, default is tool down.
-        self.declare_parameter('tool_orientation', [1.0, 0.0, 0.0, 0.0])
+        # PlanAndExecute: fixed orientation rx, ry, rz of the pendant, in radians.
+        self.declare_parameter('tcp_rotation', [math.pi, 0.0, 0.0])
         # PlanAndExecute: fraction of the maximum speed and acceleration, (0.0 - 1.0].
         self.declare_parameter('speed_scaling', 0.1)
         # PlanAndExecute: maximum duration of one motion in seconds.
@@ -126,6 +117,7 @@ class OrchestratorURServer(Node):
         self.camera_frame = None
 
         self.latest_objects_3d = []
+        self.latest_voxel_size = None
         self.motion_lock = threading.Lock()
 
         self.tf_buffer = Buffer()
@@ -153,15 +145,9 @@ class OrchestratorURServer(Node):
             callback_group=self.client_callback_group
         )
 
-        self.plan_path_client = self.create_client(
-            PlanPath,
-            PLAN_PATH_SERVICE,
-            callback_group=self.client_callback_group
-        )
-
-        self.cartesian_path_client = self.create_client(
-            GetCartesianPath,
-            CARTESIAN_PATH_SERVICE,
+        self.check_points_client = self.create_client(
+            CheckPoints,
+            CHECK_POINTS_SERVICE,
             callback_group=self.client_callback_group
         )
 
@@ -593,6 +579,7 @@ class OrchestratorURServer(Node):
 
         # PlanAndExecute finds its target here
         self.latest_objects_3d = json.loads(json_objects_3d)
+        self.latest_voxel_size = scene.voxel_size
 
         self.publish_feedback(goal_handle, 'done', 1.0)
 
@@ -614,7 +601,7 @@ class OrchestratorURServer(Node):
         speed_scaling = float(self.get_parameter('speed_scaling').value)
 
         constraints = Constraints()
-        constraints.name = 'ready_joints_goal'
+        constraints.name = 'joint_goal'
 
         for name, position in zip(UR_JOINT_NAMES, joint_positions):
             constraint = JointConstraint()
@@ -697,17 +684,17 @@ class OrchestratorURServer(Node):
 
         return motion_result
 
-    def create_tool0_pose(self, x, y, z):
-        tool_orientation = self.get_parameter('tool_orientation').value
+    def create_tool0_pose(self, position, rotation):
+        quaternion = rotation_matrix_to_quaternion(rotation)
 
         pose = Pose()
-        pose.position.x = float(x)
-        pose.position.y = float(y)
-        pose.position.z = float(z)
-        pose.orientation.x = float(tool_orientation[0])
-        pose.orientation.y = float(tool_orientation[1])
-        pose.orientation.z = float(tool_orientation[2])
-        pose.orientation.w = float(tool_orientation[3])
+        pose.position.x = float(position[0])
+        pose.position.y = float(position[1])
+        pose.position.z = float(position[2])
+        pose.orientation.x = float(quaternion[0])
+        pose.orientation.y = float(quaternion[1])
+        pose.orientation.z = float(quaternion[2])
+        pose.orientation.w = float(quaternion[3])
 
         return pose
 
@@ -740,8 +727,15 @@ class OrchestratorURServer(Node):
             )
 
     def resolve_plan_target(self, goal):
+        """Return the TCP target: hover_height above the object, or goal_point as given."""
         if goal.object_id >= 0:
-            return find_object_target(self.latest_objects_3d, goal.object_id)
+            approach_point = find_object_target(self.latest_objects_3d, goal.object_id)
+
+            return hover_point(
+                approach_point,
+                self.latest_voxel_size,
+                float(self.get_parameter('hover_height').value)
+            )
 
         target = (goal.goal_point.x, goal.goal_point.y, goal.goal_point.z)
 
@@ -750,50 +744,33 @@ class OrchestratorURServer(Node):
 
         return target
 
-    def compute_cartesian_path(self, tool0_poses, start_trajectory=None):
-        """
-        Return a slowed down MoveIt trajectory through the tool0 poses.
-
-        The path starts at the current robot state, or at the end of
-        start_trajectory when given.
-        """
+    def check_path_clear(self, trajectory, tcp_offset):
+        """Reject a trajectory whose TCP moves into an occupied voxel of the last capture."""
         service_timeout = float(self.get_parameter('service_timeout').value)
-
-        if not self.cartesian_path_client.wait_for_service(timeout_sec=5.0):
-            raise RuntimeError(f'Service not available: {CARTESIAN_PATH_SERVICE}')
-
-        request = GetCartesianPath.Request()
-        request.header.frame_id = BASE_FRAME
-        request.start_state.is_diff = True
-        request.group_name = MOVE_GROUP_NAME
-        request.link_name = MOVEIT_TARGET_LINK
-        request.max_step = CARTESIAN_MAX_STEP
-        request.jump_threshold = 0.0
-        request.revolute_jump_threshold = CARTESIAN_REVOLUTE_JUMP
-        request.avoid_collisions = True
-        request.waypoints = list(tool0_poses)
-
-        if start_trajectory is not None:
-            joint_trajectory = start_trajectory.joint_trajectory
-            request.start_state.joint_state.name = list(joint_trajectory.joint_names)
-            request.start_state.joint_state.position = list(joint_trajectory.points[-1].positions)
-
-        response =self.call_service(self.cartesian_path_client, request, service_timeout)
-
-        if response.error_code.val != MoveItErrorCodes.SUCCESS:
-            raise RuntimeError(f'Cartesian path failed with error code {response.error_code.val}')
-
-        if response.fraction < 0.999:
-            raise RuntimeError(
-                f'Cartesian path covers only {response.fraction * 100.0:.1f} % of the waypoints'
-            )
-
-        rescale_trajectory(
-            response.solution.joint_trajectory.points,
-            float(self.get_parameter('speed_scaling').value)
+        joint_trajectory = trajectory.joint_trajectory
+        samples = sample_tcp_path(
+            joint_trajectory.joint_names,
+            joint_trajectory.points,
+            tcp_offset
         )
 
-        return response.solution
+        if not self.check_points_client.wait_for_service(timeout_sec=5.0):
+            raise RuntimeError(f'Service not available: {CHECK_POINTS_SERVICE}')
+
+        request = CheckPoints.Request()
+        request.points = [Point(x=x, y=y, z=z) for x, y, z in samples]
+        response = self.call_service(self.check_points_client, request, service_timeout)
+
+        if not response.success:
+            raise RuntimeError(f'CheckPoints failed: {response.error_msg}')
+
+        blocked = first_blocked_sample(list(response.occupied))
+
+        if blocked is not None:
+            point = [round(c, 3) for c in samples[blocked]]
+            raise RuntimeError(f'Path rejected: the TCP would enter an occupied voxel at {point}')
+
+        self.get_logger().info(f'Path clear: {len(samples)} TCP samples checked')
 
     def abort_plan_and_execute(self, goal_handle, error_msg):
         self.get_logger().error(f'PlanAndExecute failed: {error_msg}')
@@ -831,92 +808,43 @@ class OrchestratorURServer(Node):
     def run_plan_and_execute(self, goal_handle):
         goal = goal_handle.request
         tcp_offset = float(self.get_parameter('tcp_offset').value)
-        service_timeout = float(self.get_parameter('service_timeout').value)
-        ready_joints = list(self.get_parameter('ready_joints').value)
-        ready_point = list(self.get_parameter('ready_point').value)
         dry_run = bool(self.get_parameter('dry_run').value)
-
-        if len(ready_joints) != len(UR_JOINT_NAMES) or not any(ready_joints):
-            raise ValueError('Set the ready_joints parameter to 6 joint positions')
-
-        if not any(ready_point):
-            raise ValueError('Set the ready_point parameter')
+        rotation = pendant_to_tool0_rotation(list(self.get_parameter('tcp_rotation').value))
 
         target = self.resolve_plan_target(goal)
-        self.get_logger().info(f'Ready point: {ready_point}, target: {target}')
+        tool0_target = tool0_position(target, rotation, tcp_offset)
+        self.publish_tool0_poses([self.create_tool0_pose(tool0_target, rotation)])
 
-        self.publish_plan_feedback(goal_handle, 'planning_to_ready_point', 0.10)
+        joints = inverse_kinematics(tool0_target, rotation)
+        self.get_logger().info(
+            f'TCP target: {[round(c, 3) for c in target]}, '
+            f'joints: {[round(j, 4) for j in joints]}'
+        )
 
-        tool0_ready = tcp_to_tool0_position(ready_point, tcp_offset)
-        self.publish_tool0_poses([self.create_tool0_pose(*tool0_ready)])
+        self.publish_plan_feedback(goal_handle, 'planning_motion', 0.20)
 
-        ready_plan = self.run_motion(
+        plan = self.run_motion(
             goal_handle,
             self.move_group_client,
-            self.create_move_group_goal(ready_joints),
+            self.create_move_group_goal(joints),
             'MoveGroup planning'
         )
 
-        if ready_plan is None:
+        if plan is None:
             return self.cancel_plan_and_execute(goal_handle)
 
-        self.check_joint_travel(ready_plan.planned_trajectory, 'Move to ready point')
+        self.check_joint_travel(plan.planned_trajectory, 'Move to target')
 
-        if not dry_run:
-            self.publish_plan_feedback(goal_handle, 'moving_to_ready_point', 0.20)
-
-            ready_goal = ExecuteTrajectory.Goal()
-            ready_goal.trajectory = ready_plan.planned_trajectory
-
-            if self.run_motion(
-                goal_handle,
-                self.execute_trajectory_client,
-                ready_goal,
-                'ExecuteTrajectory'
-            ) is None:
-                return self.cancel_plan_and_execute(goal_handle)
-
-        self.publish_plan_feedback(goal_handle, 'planning_path', 0.50)
-
-        if not self.plan_path_client.wait_for_service(timeout_sec=5.0):
-            raise RuntimeError(f'Service not available: {PLAN_PATH_SERVICE}')
-
-        plan_request = PlanPath.Request()
-        plan_request.start_point = Point(
-            x=float(ready_point[0]), y=float(ready_point[1]), z=float(ready_point[2])
-        )
-        plan_request.goal_point = Point(x=target[0], y=target[1], z=target[2])
-
-        plan_response = self.call_service(self.plan_path_client, plan_request, service_timeout)
-
-        if not plan_response.success:
-            raise RuntimeError(f'PlanPath failed: {plan_response.error_msg}')
-
-        self.publish_plan_feedback(goal_handle, 'computing_cartesian_path', 0.60)
-
-        tool0_poses = [
-            self.create_tool0_pose(
-                *tcp_to_tool0_position((waypoint.x, waypoint.y, waypoint.z), tcp_offset)
-            )
-            for waypoint in plan_response.waypoints
-        ]
-
-        self.publish_tool0_poses([self.create_tool0_pose(*tool0_ready)] + tool0_poses)
-
-        path = self.compute_cartesian_path(
-            tool0_poses,
-            ready_plan.planned_trajectory if dry_run else None
-        )
-
-        self.check_joint_travel(path, 'Cartesian path')
+        self.publish_plan_feedback(goal_handle, 'checking_path', 0.50)
+        self.check_path_clear(plan.planned_trajectory, tcp_offset)
 
         if dry_run:
-            self.get_logger().info('dry_run: plans are valid, the robot was not moved')
+            self.get_logger().info('dry_run: plan is valid, the robot was not moved')
         else:
-            self.publish_plan_feedback(goal_handle, 'executing_path', 0.70)
+            self.publish_plan_feedback(goal_handle, 'moving_to_target', 0.70)
 
             path_goal = ExecuteTrajectory.Goal()
-            path_goal.trajectory = path
+            path_goal.trajectory = plan.planned_trajectory
 
             if self.run_motion(
                 goal_handle,

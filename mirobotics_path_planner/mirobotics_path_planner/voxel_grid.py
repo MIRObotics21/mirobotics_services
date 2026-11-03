@@ -1,4 +1,4 @@
-from typing import Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 import numpy as np
 
@@ -184,6 +184,23 @@ def point_to_grid_index(
     """Grid index of the voxel containing the point, may lie outside the grid."""
     index = np.floor(np.asarray(point, dtype=np.float64) / voxel_size).astype(np.int64) - min_index
     return int(index[0]), int(index[1]), int(index[2])
+
+
+def points_occupied(
+        points: Sequence[Sequence[float]],
+        occupancy: np.ndarray,
+        min_index: np.ndarray,
+        voxel_size: float,
+) -> List[bool]:
+    """Tell for each point whether it lies in an occupied voxel, outside the grid is free."""
+    occupied = []
+
+    for point in points:
+        index = point_to_grid_index(point, min_index, voxel_size)
+        in_grid = all(0 <= i < n for i, n in zip(index, occupancy.shape))
+        occupied.append(in_grid and bool(occupancy[index]))
+
+    return occupied
 
 
 def grid_index_to_center(

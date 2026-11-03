@@ -19,7 +19,7 @@ import tf2_ros
 
 import numpy as np
 
-from mirobotics_msg.srv import CaptureScene, PlanPath
+from mirobotics_msg.srv import CaptureScene, CheckPoints, PlanPath
 from mirobotics_path_planner.astar_3d import AStar3D
 from mirobotics_path_planner.voxel_grid import (
     compute_grid,
@@ -31,6 +31,7 @@ from mirobotics_path_planner.voxel_grid import (
     id_to_grid_index,
     occupancy_to_matrix,
     point_to_grid_index,
+    points_occupied,
     quaternion_to_rotation_matrix,
     transform_points,
     voxelize,
@@ -128,6 +129,12 @@ class PathPlannerServer(Node):
             PlanPath,
             'plan_path',
             self._handle_plan_path,
+        )
+
+        self._check_points_service = self.create_service(
+            CheckPoints,
+            'check_points',
+            self._handle_check_points,
         )
 
         self.get_logger().info(
@@ -661,6 +668,31 @@ class PathPlannerServer(Node):
             response.success = False
             response.error_msg = str(exc)
             return response
+
+    def _handle_check_points(
+            self,
+            request: CheckPoints.Request,
+            response: CheckPoints.Response,
+    ) -> CheckPoints.Response:
+        with self._scene_lock:
+            if self._latest_occupancy is None:
+                response.success = False
+                response.error_msg = 'No captured scene available. Call CaptureScene first.'
+                return response
+
+            occupancy = self._latest_occupancy
+            min_index = self._latest_min_index
+            voxel_size = self._latest_voxel_size
+
+        response.occupied = points_occupied(
+            [(point.x, point.y, point.z) for point in request.points],
+            occupancy,
+            min_index,
+            voxel_size,
+        )
+        response.success = True
+        response.error_msg = ''
+        return response
 
 
 def main(args=None) -> None:

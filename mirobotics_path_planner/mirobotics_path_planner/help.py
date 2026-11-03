@@ -14,6 +14,7 @@ Node:        path_planner_server (launch argument node_name)
 Subscribes:  pointcloud2 (sensor_msgs/PointCloud2), set by launch argument pointcloud2_publisher
 Services:    /capture_scene (mirobotics_msg/srv/CaptureScene)
              /plan_path     (mirobotics_msg/srv/PlanPath)
+             /check_points  (mirobotics_msg/srv/CheckPoints)
 RViz:        voxel_grid_markers, planned_path_markers (MarkerArray, Durability Transient Local)
 
 Order: call capture_scene first, plan_path plans on the grid of the last capture.
@@ -69,6 +70,20 @@ TOPICS = {
 
   An occupied point moves to the nearest free voxel within snap_distance.
   A point outside the workspace box is an error.
+""",
+    'check_points': """\
+/check_points (mirobotics_msg/srv/CheckPoints)
+  Tells which points lie in an occupied voxel of the last capture_scene.
+
+  Request:
+    points       list of x, y, z in planning_frame in meters
+  Response:
+    success, error_msg
+    occupied     one value per point, a point outside the grid is free
+
+  Example:
+    ros2 service call /check_points mirobotics_msg/srv/CheckPoints \\
+      "{points: [{x: 0.21, y: 0.13, z: 0.13}]}"
 """,
     'parameters': """\
 Parameters (ros2 param set /path_planner_server <name> <value>)

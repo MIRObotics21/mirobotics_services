@@ -1,12 +1,13 @@
+import math
 from typing import Dict, List, Optional, Sequence, Tuple
+
+from mirobotics_orchestrator_ur.ur_kinematics import tcp_position, UR_JOINT_NAMES
 
 
 Position = Tuple[float, float, float]
 
-
-def tcp_to_tool0_position(point: Sequence[float], tcp_offset: float) -> Position:
-    """Convert a TCP position to the tool0 position with the tool pointing straight down."""
-    return float(point[0]), float(point[1]), float(point[2]) + float(tcp_offset)
+# Largest joint change between two path samples in radians, about 1 cm at the TCP
+PATH_SAMPLE_STEP = 0.02
 
 
 def find_object_target(objects_3d: List[Dict], object_id: int) -> Position:
@@ -32,6 +33,13 @@ def find_object_target(objects_3d: List[Dict], object_id: int) -> Position:
     return float(approach_point[0]), float(approach_point[1]), float(approach_point[2])
 
 
+def hover_point(approach_point: Sequence[float], voxel_size: float, height: float) -> Position:
+    """Return the point height above the object, whose top is the bottom of the approach voxel."""
+    top = float(approach_point[2]) - float(voxel_size) / 2.0
+
+    return float(approach_point[0]), float(approach_point[1]), top + float(height)
+
+
 def largest_joint_travel(joint_names: Sequence[str], points: Sequence) -> Tuple[str, float]:
     """Return the joint with the largest range of motion in the trajectory and that range."""
     largest_name = ''
@@ -47,20 +55,49 @@ def largest_joint_travel(joint_names: Sequence[str], points: Sequence) -> Tuple[
     return largest_name, largest_travel
 
 
-def rescale_trajectory(points: Sequence, speed_scaling: float) -> None:
+def sample_tcp_path(
+    joint_names: Sequence[str],
+    points: Sequence,
+    tcp_offset: float
+) -> List[Position]:
+    """Return TCP positions along a trajectory, interpolated between its points."""
+    order = [list(joint_names).index(name) for name in UR_JOINT_NAMES]
+    trajectory = [[point.positions[index] for index in order] for point in points]
+
+    if not trajectory:
+        return []
+
+    samples = [tcp_position(trajectory[0], tcp_offset)]
+
+    for start, end in zip(trajectory, trajectory[1:]):
+        largest_step = max(abs(b - a) for a, b in zip(start, end))
+        steps = max(1, math.ceil(largest_step / PATH_SAMPLE_STEP))
+
+        for step in range(1, steps + 1):
+            fraction = step / steps
+            joints = [a + (b - a) * fraction for a, b in zip(start, end)]
+            samples.append(tcp_position(joints, tcp_offset))
+
+    return samples
+
+
+def first_blocked_sample(occupied: Sequence[bool]) -> Optional[int]:
     """
-    Slow down trajectory points in place by speed_scaling (0.0 - 1.0].
+    Return the index of the first occupied sample the TCP moves into, or None.
 
-    GetCartesianPath trajectories are timed at full joint speed by default.
+    Occupied samples at the start are skipped: the camera sees the robot, so the
+    TCP can start inside its own voxels.
     """
-    if speed_scaling <= 0.0 or speed_scaling > 1.0:
-        raise ValueError('speed_scaling must be in the range (0.0, 1.0].')
+    left_start = False
 
-    for point in points:
-        nanoseconds = point.time_from_start.sec * 1000000000 + point.time_from_start.nanosec
-        nanoseconds = int(round(nanoseconds / speed_scaling))
+    for index, sample_occupied in enumerate(occupied):
+        if not sample_occupied:
+            left_start = True
+        elif left_start:
+            return index
 
-        point.time_from_start.sec = nanoseconds // 1000000000
-        point.time_from_start.nanosec = nanoseconds % 1000000000
-        point.velocities = [v * speed_scaling for v in point.velocities]
-        point.accelerations = [a * speed_scaling * speed_scaling for a in point.accelerations]
+    # The TCP never leaves the occupied voxels, the target is occupied too
+    if occupied and not left_start:
+        return len(occupied) - 1
+
+    return None
