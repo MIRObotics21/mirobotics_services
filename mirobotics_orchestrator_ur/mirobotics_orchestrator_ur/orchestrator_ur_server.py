@@ -20,6 +20,7 @@ from moveit_msgs.msg import (
     MoveItErrorCodes,
     PlanningOptions,
 )
+from moveit_msgs.srv import GetCartesianPath
 
 from sensor_msgs.msg import CameraInfo
 from visualization_msgs.msg import Marker, MarkerArray
@@ -31,14 +32,16 @@ from tf2_ros import (
     TransformListener,
 )
 
-from mirobotics_msg.action import GenerateScene, PlanAndExecute
-from mirobotics_msg.srv import EvalScene, CaptureScene, CheckPoints
+from mirobotics_msg.action import GenerateScene, MoveBetween, PlanAndExecute
+from mirobotics_msg.srv import EvalScene, CaptureScene, CheckPoints, PlanPath
 
 from mirobotics_orchestrator_ur.moveit_execution import (
     find_object_target,
     first_blocked_sample,
     hover_point,
     largest_joint_travel,
+    rescale_trajectory,
+    round_corners,
     sample_tcp_path,
 )
 from mirobotics_orchestrator_ur.ray_casting import assign_objects_to_voxels, parse_scene_grid
@@ -54,6 +57,7 @@ BASE_FRAME = 'base_link'
 SCENE_EVAL_SERVICE = '/eval_scene'
 CAPTURE_SCENE_SERVICE = '/capture_scene'
 CHECK_POINTS_SERVICE = '/check_points'
+PLAN_PATH_SERVICE = '/plan_path'
 
 # Marker colors per object type, assigned in order of first appearance
 OBJECT_COLORS = [
@@ -67,8 +71,13 @@ OBJECT_COLORS = [
 
 MOVE_GROUP_ACTION = '/move_action'
 EXECUTE_TRAJECTORY_ACTION = '/execute_trajectory'
+CARTESIAN_PATH_SERVICE = '/compute_cartesian_path'
 MOVE_GROUP_NAME = 'ur_manipulator'
+MOVEIT_TARGET_LINK = 'tool0'
 JOINT_TOLERANCE = 0.01
+CARTESIAN_MAX_STEP = 0.005
+# Largest joint change between two Cartesian path steps in radians, stops the path at a flip
+CARTESIAN_REVOLUTE_JUMP = 0.5
 
 
 class OrchestratorURServer(Node):
@@ -87,24 +96,27 @@ class OrchestratorURServer(Node):
 
         # Maximum distance from the camera searched for an object, in meters.
         self.declare_parameter('ray_max_distance', 3.0)
-        # Maximum time to wait for a response of EvalScene, CaptureScene and CheckPoints, in
-        # seconds.
+        # Maximum time to wait for a response of the services, in seconds.
         self.declare_parameter('service_timeout', 30.0)
         # Publish object, hit point and approach voxels for RViz after each GenerateScene.
         self.declare_parameter('publish_markers', True)
-        # PlanAndExecute: height of the TCP above the top of the object, in meters.
+        # Motions (PlanAndExecute, MoveBetween):
+        # height of the TCP above the top of the object, in meters.
         self.declare_parameter('hover_height', 0.05)
-        # PlanAndExecute: distance from tool0 to the TCP along the tool axis, in meters.
+        # Distance from tool0 to the TCP along the tool axis, in meters.
         self.declare_parameter('tcp_offset', 0.1866)
-        # PlanAndExecute: fixed orientation rx, ry, rz of the pendant, in radians.
+        # Fixed orientation rx, ry, rz of the pendant, in radians.
         self.declare_parameter('tcp_rotation', [math.pi, 0.0, 0.0])
-        # PlanAndExecute: fraction of the maximum speed and acceleration, (0.0 - 1.0].
+        # MoveBetween: corners of the path are rounded from this distance before them, in
+        # meters, like the blend radius on the pendant. 0 keeps sharp corners.
+        self.declare_parameter('blend_radius', 0.02)
+        # Fraction of the maximum speed and acceleration, (0.0 - 1.0].
         self.declare_parameter('speed_scaling', 0.1)
-        # PlanAndExecute: maximum duration of one motion in seconds.
+        # Maximum duration of one motion in seconds.
         self.declare_parameter('motion_timeout', 120.0)
-        # PlanAndExecute: a plan is rejected if one joint travels more than this, in radians.
+        # A plan is rejected if one joint travels more than this, in radians.
         self.declare_parameter('max_joint_travel', 3.14)
-        # PlanAndExecute: plan and publish everything but do not move the robot.
+        # Plan, check and publish everything but do not move the robot.
         self.declare_parameter('dry_run', False)
 
         self.camera_info_received = False
@@ -151,6 +163,18 @@ class OrchestratorURServer(Node):
             callback_group=self.client_callback_group
         )
 
+        self.plan_path_client = self.create_client(
+            PlanPath,
+            PLAN_PATH_SERVICE,
+            callback_group=self.client_callback_group
+        )
+
+        self.cartesian_path_client = self.create_client(
+            GetCartesianPath,
+            CARTESIAN_PATH_SERVICE,
+            callback_group=self.client_callback_group
+        )
+
         # Latched, RViz receives the last scene even when started later.
         marker_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -183,6 +207,15 @@ class OrchestratorURServer(Node):
             PlanAndExecute,
             'plan_and_execute',
             self.execute_plan_and_execute_callback,
+            callback_group=self.client_callback_group,
+            cancel_callback=lambda _: CancelResponse.ACCEPT
+        )
+
+        self.move_between_action_server = ActionServer(
+            self,
+            MoveBetween,
+            'move_between',
+            self.execute_move_between_callback,
             callback_group=self.client_callback_group,
             cancel_callback=lambda _: CancelResponse.ACCEPT
         )
@@ -586,14 +619,15 @@ class OrchestratorURServer(Node):
         goal_handle.succeed()
         return result
 
-    def publish_plan_feedback(self, goal_handle, current_step, progress):
-        feedback = PlanAndExecute.Feedback()
+    def publish_motion_feedback(self, goal_handle, action, current_step, progress):
+        """Publish feedback of PlanAndExecute or MoveBetween, both have the same fields."""
+        feedback = action.Feedback()
         feedback.current_step = current_step
         feedback.progress = float(progress)
         goal_handle.publish_feedback(feedback)
 
         self.get_logger().info(
-            f'PlanAndExecute feedback: {current_step} ({progress:.2f})'
+            f'{action.__name__} feedback: {current_step} ({progress:.2f})'
         )
 
     def create_move_group_goal(self, joint_positions):
@@ -726,10 +760,10 @@ class OrchestratorURServer(Node):
                 f'max_joint_travel is {math.degrees(limit):.1f} deg'
             )
 
-    def resolve_plan_target(self, goal):
-        """Return the TCP target: hover_height above the object, or goal_point as given."""
-        if goal.object_id >= 0:
-            approach_point = find_object_target(self.latest_objects_3d, goal.object_id)
+    def resolve_tcp_target(self, object_id, point, name):
+        """Return the TCP target: hover_height above the object, or the point as given."""
+        if object_id >= 0:
+            approach_point = find_object_target(self.latest_objects_3d, object_id)
 
             return hover_point(
                 approach_point,
@@ -737,22 +771,16 @@ class OrchestratorURServer(Node):
                 float(self.get_parameter('hover_height').value)
             )
 
-        target = (goal.goal_point.x, goal.goal_point.y, goal.goal_point.z)
+        target = (point.x, point.y, point.z)
 
         if not any(target):
-            raise ValueError('Set object_id or goal_point')
+            raise ValueError(f'Set {name}_object_id or {name}_point')
 
         return target
 
-    def check_path_clear(self, trajectory, tcp_offset):
-        """Reject a trajectory whose TCP moves into an occupied voxel of the last capture."""
+    def check_points_clear(self, samples, name):
+        """Reject TCP samples that move into an occupied voxel of the last capture."""
         service_timeout = float(self.get_parameter('service_timeout').value)
-        joint_trajectory = trajectory.joint_trajectory
-        samples = sample_tcp_path(
-            joint_trajectory.joint_names,
-            joint_trajectory.points,
-            tcp_offset
-        )
 
         if not self.check_points_client.wait_for_service(timeout_sec=5.0):
             raise RuntimeError(f'Service not available: {CHECK_POINTS_SERVICE}')
@@ -768,60 +796,25 @@ class OrchestratorURServer(Node):
 
         if blocked is not None:
             point = [round(c, 3) for c in samples[blocked]]
-            raise RuntimeError(f'Path rejected: the TCP would enter an occupied voxel at {point}')
+            raise RuntimeError(
+                f'{name} rejected: the TCP would enter an occupied voxel at {point}'
+            )
 
-        self.get_logger().info(f'Path clear: {len(samples)} TCP samples checked')
+        self.get_logger().info(f'{name} clear: {len(samples)} TCP samples checked')
 
-    def abort_plan_and_execute(self, goal_handle, error_msg):
-        self.get_logger().error(f'PlanAndExecute failed: {error_msg}')
+    def plan_joint_move(self, goal_handle, target, rotation, tcp_offset, name):
+        """
+        Plan a checked joint move from the current state to the TCP target.
 
-        result = PlanAndExecute.Result()
-        result.success = False
-        result.error_msg = error_msg
-
-        goal_handle.abort()
-        return result
-
-    def cancel_plan_and_execute(self, goal_handle):
-        self.get_logger().info('PlanAndExecute canceled')
-
-        result = PlanAndExecute.Result()
-        result.success = False
-        result.error_msg = 'Canceled'
-
-        goal_handle.canceled()
-        return result
-
-    def execute_plan_and_execute_callback(self, goal_handle):
-        self.get_logger().info('PlanAndExecute action goal received')
-
-        if not self.motion_lock.acquire(blocking=False):
-            return self.abort_plan_and_execute(goal_handle, 'Another motion is running')
-
-        try:
-            return self.run_plan_and_execute(goal_handle)
-        except Exception as exc:
-            return self.abort_plan_and_execute(goal_handle, str(exc))
-        finally:
-            self.motion_lock.release()
-
-    def run_plan_and_execute(self, goal_handle):
-        goal = goal_handle.request
-        tcp_offset = float(self.get_parameter('tcp_offset').value)
-        dry_run = bool(self.get_parameter('dry_run').value)
-        rotation = pendant_to_tool0_rotation(list(self.get_parameter('tcp_rotation').value))
-
-        target = self.resolve_plan_target(goal)
+        Returns the trajectory, or None when the action was canceled.
+        """
         tool0_target = tool0_position(target, rotation, tcp_offset)
-        self.publish_tool0_poses([self.create_tool0_pose(tool0_target, rotation)])
-
         joints = inverse_kinematics(tool0_target, rotation)
-        self.get_logger().info(
-            f'TCP target: {[round(c, 3) for c in target]}, '
-            f'joints: {[round(j, 4) for j in joints]}'
-        )
 
-        self.publish_plan_feedback(goal_handle, 'planning_motion', 0.20)
+        self.get_logger().info(
+            f'{name}: TCP target {[round(c, 3) for c in target]}, '
+            f'joints {[round(j, 4) for j in joints]}'
+        )
 
         plan = self.run_motion(
             goal_handle,
@@ -831,37 +824,239 @@ class OrchestratorURServer(Node):
         )
 
         if plan is None:
-            return self.cancel_plan_and_execute(goal_handle)
+            return None
 
-        self.check_joint_travel(plan.planned_trajectory, 'Move to target')
+        trajectory = plan.planned_trajectory
+        self.check_joint_travel(trajectory, name)
 
-        self.publish_plan_feedback(goal_handle, 'checking_path', 0.50)
-        self.check_path_clear(plan.planned_trajectory, tcp_offset)
+        joint_trajectory = trajectory.joint_trajectory
+        self.check_points_clear(
+            sample_tcp_path(joint_trajectory.joint_names, joint_trajectory.points, tcp_offset),
+            name
+        )
+
+        return trajectory
+
+    def plan_tcp_path(self, start, goal):
+        """Return the PlanPath waypoints from start to goal, which must stay exactly in place."""
+        service_timeout = float(self.get_parameter('service_timeout').value)
+
+        if not self.plan_path_client.wait_for_service(timeout_sec=5.0):
+            raise RuntimeError(f'Service not available: {PLAN_PATH_SERVICE}')
+
+        request = PlanPath.Request()
+        request.start_point = Point(x=float(start[0]), y=float(start[1]), z=float(start[2]))
+        request.goal_point = Point(x=float(goal[0]), y=float(goal[1]), z=float(goal[2]))
+
+        response = self.call_service(self.plan_path_client, request, service_timeout)
+
+        if not response.success:
+            raise RuntimeError(f'PlanPath failed: {response.error_msg}')
+
+        waypoints = [(w.x, w.y, w.z) for w in response.waypoints]
+
+        # PlanPath moves a blocked point to a free voxel, that would not be above the object
+        for name, requested, planned in (
+                ('start', start, waypoints[0]),
+                ('goal', goal, waypoints[-1])):
+            if math.dist(requested, planned) > 0.001:
+                raise RuntimeError(
+                    f'The {name} {[round(c, 3) for c in requested]} is too close to an obstacle '
+                    f'for the gripper (tool_radius of the path planner)'
+                )
+
+        self.get_logger().info(
+            f'{len(waypoints)} TCP waypoints: '
+            f'{[[round(c, 3) for c in waypoint] for waypoint in waypoints]}'
+        )
+
+        return waypoints
+
+    def compute_cartesian_path(self, tool0_poses, start_trajectory):
+        """Return a slowed down trajectory through the tool0 poses from start_trajectory's end."""
+        service_timeout = float(self.get_parameter('service_timeout').value)
+
+        if not self.cartesian_path_client.wait_for_service(timeout_sec=5.0):
+            raise RuntimeError(f'Service not available: {CARTESIAN_PATH_SERVICE}')
+
+        start = start_trajectory.joint_trajectory
+
+        request = GetCartesianPath.Request()
+        request.header.frame_id = BASE_FRAME
+        request.start_state.is_diff = True
+        request.start_state.joint_state.name = list(start.joint_names)
+        request.start_state.joint_state.position = list(start.points[-1].positions)
+        request.group_name = MOVE_GROUP_NAME
+        request.link_name = MOVEIT_TARGET_LINK
+        request.max_step = CARTESIAN_MAX_STEP
+        request.jump_threshold = 0.0
+        request.revolute_jump_threshold = CARTESIAN_REVOLUTE_JUMP
+        request.avoid_collisions = True
+        request.waypoints = list(tool0_poses)
+
+        response = self.call_service(self.cartesian_path_client, request, service_timeout)
+
+        if response.error_code.val != MoveItErrorCodes.SUCCESS:
+            raise RuntimeError(f'Cartesian path failed with error code {response.error_code.val}')
+
+        if response.fraction < 0.999:
+            solution = response.solution.joint_trajectory
+
+            if solution.points:
+                last_joints = [round(position, 4) for position in solution.points[-1].positions]
+                self.get_logger().error(
+                    f'Cartesian path stopped after {len(solution.points)} points '
+                    f'at {dict(zip(solution.joint_names, last_joints))}'
+                )
+
+            raise RuntimeError(
+                f'Cartesian path covers only {response.fraction * 100.0:.1f} % of the waypoints'
+            )
+
+        rescale_trajectory(
+            response.solution.joint_trajectory.points,
+            float(self.get_parameter('speed_scaling').value)
+        )
+
+        return response.solution
+
+    def execute_trajectory(self, goal_handle, trajectory):
+        """Execute a planned trajectory, returns False when the action was canceled."""
+        execute_goal = ExecuteTrajectory.Goal()
+        execute_goal.trajectory = trajectory
+
+        return self.run_motion(
+            goal_handle,
+            self.execute_trajectory_client,
+            execute_goal,
+            'ExecuteTrajectory'
+        ) is not None
+
+    def run_motion_action(self, goal_handle, action, run):
+        """Run one motion action at a time and turn its outcome into the action result."""
+        name = action.__name__
+        self.get_logger().info(f'{name} action goal received')
+
+        result = action.Result()
+        result.success = False
+
+        if not self.motion_lock.acquire(blocking=False):
+            result.error_msg = 'Another motion is running'
+            self.get_logger().error(f'{name} failed: {result.error_msg}')
+            goal_handle.abort()
+            return result
+
+        try:
+            completed = run(goal_handle)
+        except Exception as exc:
+            result.error_msg = str(exc)
+            self.get_logger().error(f'{name} failed: {result.error_msg}')
+            goal_handle.abort()
+            return result
+        finally:
+            self.motion_lock.release()
+
+        if not completed:
+            result.error_msg = 'Canceled'
+            self.get_logger().info(f'{name} canceled')
+            goal_handle.canceled()
+            return result
+
+        self.publish_motion_feedback(goal_handle, action, 'done', 1.0)
+        result.success = True
+        result.error_msg = ''
+        goal_handle.succeed()
+        return result
+
+    def execute_plan_and_execute_callback(self, goal_handle):
+        return self.run_motion_action(goal_handle, PlanAndExecute, self.run_plan_and_execute)
+
+    def execute_move_between_callback(self, goal_handle):
+        return self.run_motion_action(goal_handle, MoveBetween, self.run_move_between)
+
+    def motion_settings(self):
+        """Return tcp_offset, dry_run and the fixed tool0 rotation from the parameters."""
+        return (
+            float(self.get_parameter('tcp_offset').value),
+            bool(self.get_parameter('dry_run').value),
+            pendant_to_tool0_rotation(list(self.get_parameter('tcp_rotation').value)),
+        )
+
+    def run_plan_and_execute(self, goal_handle):
+        """Move above an object in one joint move, returns False when canceled."""
+        goal = goal_handle.request
+        tcp_offset, dry_run, rotation = self.motion_settings()
+
+        target = self.resolve_tcp_target(goal.object_id, goal.goal_point, 'goal')
+        self.publish_tool0_poses([
+            self.create_tool0_pose(tool0_position(target, rotation, tcp_offset), rotation)
+        ])
+
+        self.publish_motion_feedback(goal_handle, PlanAndExecute, 'planning_motion', 0.20)
+        trajectory = self.plan_joint_move(
+            goal_handle, target, rotation, tcp_offset, 'Move to target'
+        )
+
+        if trajectory is None:
+            return False
 
         if dry_run:
             self.get_logger().info('dry_run: plan is valid, the robot was not moved')
-        else:
-            self.publish_plan_feedback(goal_handle, 'moving_to_target', 0.70)
+            return True
 
-            path_goal = ExecuteTrajectory.Goal()
-            path_goal.trajectory = plan.planned_trajectory
+        self.publish_motion_feedback(goal_handle, PlanAndExecute, 'moving_to_target', 0.70)
+        return self.execute_trajectory(goal_handle, trajectory)
 
-            if self.run_motion(
-                goal_handle,
-                self.execute_trajectory_client,
-                path_goal,
-                'ExecuteTrajectory'
-            ) is None:
-                return self.cancel_plan_and_execute(goal_handle)
+    def run_move_between(self, goal_handle):
+        """
+        Move above the start, then along the path to above the goal without stopping.
 
-        self.publish_plan_feedback(goal_handle, 'done', 1.0)
+        Everything is planned and checked before the robot moves. Returns False
+        when canceled.
+        """
+        goal = goal_handle.request
+        tcp_offset, dry_run, rotation = self.motion_settings()
 
-        result = PlanAndExecute.Result()
-        result.success = True
-        result.error_msg = ''
+        start = self.resolve_tcp_target(goal.start_object_id, goal.start_point, 'start')
+        target = self.resolve_tcp_target(goal.goal_object_id, goal.goal_point, 'goal')
 
-        goal_handle.succeed()
-        return result
+        self.publish_motion_feedback(goal_handle, MoveBetween, 'planning_path', 0.10)
+        path_points = round_corners(
+            self.plan_tcp_path(start, target),
+            float(self.get_parameter('blend_radius').value)
+        )
+        self.check_points_clear(path_points, 'Path to goal')
+
+        tool0_poses = [
+            self.create_tool0_pose(tool0_position(point, rotation, tcp_offset), rotation)
+            for point in path_points
+        ]
+        self.publish_tool0_poses(tool0_poses)
+
+        self.publish_motion_feedback(goal_handle, MoveBetween, 'planning_move_to_start', 0.30)
+        start_trajectory = self.plan_joint_move(
+            goal_handle, start, rotation, tcp_offset, 'Move to start'
+        )
+
+        if start_trajectory is None:
+            return False
+
+        self.publish_motion_feedback(goal_handle, MoveBetween, 'planning_cartesian_path', 0.50)
+        # The first pose is the start itself, where the start move ends
+        path_trajectory = self.compute_cartesian_path(tool0_poses[1:], start_trajectory)
+        self.check_joint_travel(path_trajectory, 'Path to goal')
+
+        if dry_run:
+            self.get_logger().info('dry_run: plans are valid, the robot was not moved')
+            return True
+
+        self.publish_motion_feedback(goal_handle, MoveBetween, 'moving_to_start', 0.60)
+
+        if not self.execute_trajectory(goal_handle, start_trajectory):
+            return False
+
+        self.publish_motion_feedback(goal_handle, MoveBetween, 'moving_to_goal', 0.80)
+        return self.execute_trajectory(goal_handle, path_trajectory)
 
 
 def main(args=None) -> None:

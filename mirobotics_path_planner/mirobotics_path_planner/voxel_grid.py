@@ -1,3 +1,4 @@
+import math
 from typing import List, Sequence, Tuple
 
 import numpy as np
@@ -184,6 +185,48 @@ def point_to_grid_index(
     """Grid index of the voxel containing the point, may lie outside the grid."""
     index = np.floor(np.asarray(point, dtype=np.float64) / voxel_size).astype(np.int64) - min_index
     return int(index[0]), int(index[1]), int(index[2])
+
+
+def block_tool_space(
+        occupancy: np.ndarray,
+        voxel_size: float,
+        tool_radius: float,
+        bottom_clearance: float,
+) -> np.ndarray:
+    """
+    Block every voxel where a vertical tool with the TCP in it would touch an obstacle.
+
+    The tool is a cylinder of tool_radius reaching up from the TCP. A voxel is
+    blocked when an occupied column lies within tool_radius horizontally and its
+    top is less than bottom_clearance below the voxel center. The TCP therefore
+    passes over obstacles but never beside them. Occupied voxels stay blocked.
+    """
+    if tool_radius <= 0.0:
+        return occupancy.astype(bool, copy=True)
+
+    nx, ny, nz = occupancy.shape
+    has_top = occupancy.any(axis=2)
+    # Height of the top surface of each column above the grid bottom, -inf without obstacle
+    top_index = nz - 1 - np.argmax(occupancy[:, :, ::-1], axis=2)
+    top_height = np.where(has_top, (top_index + 1) * voxel_size, -np.inf)
+
+    reach = int(math.floor(tool_radius / voxel_size + _INDEX_EPSILON))
+    padded = np.full((nx + 2 * reach, ny + 2 * reach), -np.inf)
+    padded[reach:reach + nx, reach:reach + ny] = top_height
+    nearby_top = np.full((nx, ny), -np.inf)
+
+    for dx in range(-reach, reach + 1):
+        for dy in range(-reach, reach + 1):
+            if (dx * dx + dy * dy) * voxel_size * voxel_size > tool_radius * tool_radius + 1e-12:
+                continue
+
+            shifted = padded[reach + dx:reach + dx + nx, reach + dy:reach + dy + ny]
+            nearby_top = np.maximum(nearby_top, shifted)
+
+    center_height = (np.arange(nz) + 0.5) * voxel_size
+    blocked = center_height[None, None, :] - nearby_top[:, :, None] < bottom_clearance
+
+    return occupancy.astype(bool) | blocked
 
 
 def points_occupied(

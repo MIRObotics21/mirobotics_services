@@ -37,6 +37,9 @@ def generate_launch_description():
                 'clearance_voxels': 2,
                 'clearance_cost': 5.0,
                 'snap_distance': 0.05,
+                # Gripper as a vertical cylinder above the TCP, 0.0 plans for the TCP only.
+                'tool_radius': 0.05,
+                'tool_bottom_clearance': 0.02,
             }],
             remappings=[
                 ('pointcloud2', pointcloud2_publisher),

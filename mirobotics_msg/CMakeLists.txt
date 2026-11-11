@@ -20,6 +20,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/CheckPoints.srv"
   "action/GenerateScene.action"
   "action/PlanAndExecute.action"
+  "action/MoveBetween.action"
   DEPENDENCIES geometry_msgs
 )
 

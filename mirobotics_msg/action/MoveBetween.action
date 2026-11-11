@@ -1,0 +1,17 @@
+# Move the TCP from above one object to above another along a PlanPath path
+# (action /move_between). The robot first moves from where it is to the start,
+# then follows the path to the goal without stopping, with a fixed tool orientation.
+# Object ids from the last GenerateScene, the TCP goes hover_height above the object.
+# -1 uses start_point or goal_point instead.
+int64 start_object_id -1
+int64 goal_object_id -1
+# TCP positions in base_link, in meters.
+geometry_msgs/Point start_point
+geometry_msgs/Point goal_point
+---
+bool success
+string error_msg
+---
+# Name of the step being executed and progress 0.0 - 1.0
+string current_step
+float32 progress

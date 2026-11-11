@@ -52,6 +52,8 @@ TOPICS = {
 /plan_path (mirobotics_msg/srv/PlanPath)
   A* with 26 neighbours on the grid of the last capture_scene. Voxels near obstacles
   cost more (clearance_voxels, clearance_cost), so the path keeps its distance.
+  The gripper is a vertical cylinder of tool_radius above the TCP: the TCP passes over
+  obstacles, at least tool_bottom_clearance above them, never beside them.
 
   Request (start and goal each by voxel id, or by point when the id is -1):
     start_id, goal_id         voxel ids, default -1
@@ -68,7 +70,7 @@ TOPICS = {
     ros2 service call /plan_path mirobotics_msg/srv/PlanPath \\
       "{start_point: {x: -0.3, y: -0.3, z: 0.4}, goal_point: {x: 0.21, y: 0.13, z: 0.13}}"
 
-  An occupied point moves to the nearest free voxel within snap_distance.
+  A blocked point moves to the nearest free voxel within snap_distance.
   A point outside the workspace box is an error.
 """,
     'check_points': """\
@@ -98,6 +100,8 @@ Parameters (ros2 param set /path_planner_server <name> <value>)
   clearance_voxels      2                   Clearance zone, (2 * n + 1)^3 cube around obstacles
   clearance_cost        5.0                 Cost factor of the clearance zone, 1.0 = no clearance
   snap_distance         0.05                Snap distance for occupied start/goal points in meters
+  tool_radius           0.05                Gripper cylinder radius in meters, 0.0 = TCP point only
+  tool_bottom_clearance 0.02                Minimum height of the TCP above nearby obstacles
 """,
 }
 

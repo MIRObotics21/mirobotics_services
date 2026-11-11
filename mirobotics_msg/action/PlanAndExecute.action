@@ -1,10 +1,9 @@
-# Move the tool to an object or a point with MoveIt 2 (action /plan_and_execute).
-# The robot moves to the ready_point parameter, then follows a PlanPath path
-# from there to the target with the tool pointing down.
-# Object id from the last GenerateScene, the target is its approach point.
+# Move the TCP above an object or to a point with MoveIt 2 (action /plan_and_execute).
+# One joint move from where the robot is, with a fixed tool orientation.
+# Object id from the last GenerateScene, the TCP goes hover_height above the object.
 # -1 uses goal_point instead.
 int64 object_id -1
-# TCP target in the grid frame, in meters.
+# TCP target in base_link, in meters.
 geometry_msgs/Point goal_point
 ---
 bool success

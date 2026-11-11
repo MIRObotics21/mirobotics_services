@@ -2,6 +2,7 @@ import numpy as np
 
 from mirobotics_path_planner.astar_3d import AStar3D
 from mirobotics_path_planner.voxel_grid import (
+    block_tool_space,
     compute_grid,
     crop_to_workspace,
     fill_below_occupied,
@@ -20,6 +21,38 @@ from mirobotics_path_planner.voxel_grid import (
 
 WORKSPACE_MIN = [-0.5, -0.5, 0.0]
 WORKSPACE_MAX = [0.5, 0.5, 0.6]
+
+
+def test_block_tool_space_keeps_the_tool_beside_obstacles_free_only_above_them():
+    occupancy = np.zeros((11, 11, 10), dtype=bool)
+    # 3 cm high obstacle in the center column, 1 cm voxels
+    occupancy[5, 5, :3] = True
+
+    blocked = block_tool_space(occupancy, 0.01, 0.03, 0.02)
+
+    # beside the obstacle the whole height up to 2 cm above its top is blocked
+    assert blocked[8, 5, :5].all()
+    assert not blocked[8, 5, 5]
+    # diagonal (2, 2) is 2.8 cm away, inside the radius; (3, 3) at 4.2 cm is not
+    assert blocked[7, 7, 4]
+    assert not blocked[8, 8, 0]
+    # above the obstacle 5 cm over its top, the hover height, is free
+    assert not blocked[5, 5, 7]
+    # the obstacle itself stays blocked
+    assert blocked[5, 5, :3].all()
+
+
+def test_block_tool_space_without_radius_is_the_occupancy():
+    occupancy = np.zeros((4, 4, 4), dtype=bool)
+    occupancy[1, 1, 0] = True
+
+    assert np.array_equal(block_tool_space(occupancy, 0.01, 0.0, 0.02), occupancy)
+
+
+def test_block_tool_space_leaves_an_empty_grid_free():
+    occupancy = np.zeros((4, 4, 4), dtype=bool)
+
+    assert not block_tool_space(occupancy, 0.01, 0.05, 0.02).any()
 
 
 def test_points_occupied_treats_outside_of_the_grid_as_free():

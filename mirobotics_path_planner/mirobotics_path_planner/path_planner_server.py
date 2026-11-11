@@ -22,6 +22,7 @@ import numpy as np
 from mirobotics_msg.srv import CaptureScene, CheckPoints, PlanPath
 from mirobotics_path_planner.astar_3d import AStar3D
 from mirobotics_path_planner.voxel_grid import (
+    block_tool_space,
     compute_grid,
     crop_to_workspace,
     fill_below_occupied,
@@ -69,6 +70,11 @@ class PathPlannerServer(Node):
         # PlanPath: an occupied start or goal point is moved to the nearest free
         # voxel within this distance in meters.
         self.declare_parameter('snap_distance', 0.05)
+        # PlanPath: the tool reaches up from the TCP as a cylinder of tool_radius. A voxel is
+        # blocked when an obstacle lies within tool_radius horizontally and its top is less
+        # than tool_bottom_clearance below the voxel. 0 plans for the TCP point only.
+        self.declare_parameter('tool_radius', 0.05)
+        self.declare_parameter('tool_bottom_clearance', 0.02)
 
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
@@ -591,7 +597,12 @@ class PathPlannerServer(Node):
             time_start = time.perf_counter()
 
             planner = AStar3D(
-                occupancy,
+                block_tool_space(
+                    occupancy,
+                    voxel_size,
+                    float(self.get_parameter('tool_radius').value),
+                    float(self.get_parameter('tool_bottom_clearance').value),
+                ),
                 clearance_voxels=int(self.get_parameter('clearance_voxels').value),
                 clearance_cost=float(self.get_parameter('clearance_cost').value),
             )

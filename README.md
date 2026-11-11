@@ -106,6 +106,7 @@ ROS 2 interfaces package containing:
 
 * `GenerateScene.action`
 * `PlanAndExecute.action`
+* `MoveBetween.action`
 
 ---
 
@@ -192,6 +193,8 @@ Voxelization and 3D A* planning package.
 | `clearance_voxels` | `2` | PlanPath: free voxels inside a `(2 * clearance_voxels + 1)^3` cube around an occupied voxel form the clearance zone. `2` gives a 5x5x5 cube. |
 | `clearance_cost` | `5.0` | PlanPath: entering a clearance zone voxel costs this many times more. `1.0` disables the clearance. |
 | `snap_distance` | `0.05` | PlanPath: an occupied start or goal point is moved to the nearest free voxel within this distance in meters. |
+| `tool_radius` | `0.05` | PlanPath: the gripper is a vertical cylinder of this radius reaching up from the TCP. A voxel is blocked when an obstacle lies within this horizontal distance, so the TCP passes over obstacles but never beside them. `0.0` plans for the TCP point only. |
+| `tool_bottom_clearance` | `0.02` | PlanPath: minimum height of a voxel center above the top of obstacles within `tool_radius`, in meters. |
 
 The point cloud is transformed into `planning_frame` first, so the workspace box is given in robot coordinates.
 Points outside the box are discarded and the voxel grid always covers the whole box.
@@ -472,6 +475,7 @@ Only the TCP is checked against the voxel grid, not the arm. Canceling the goal 
 |---|---|---|
 | `hover_height` | `0.05` | Height of the TCP above the top of the object, in meters. |
 | `tcp_offset` | `0.1866` | Distance from `tool0` to the TCP along the tool axis, in meters. |
+| `blend_radius` | `0.02` | MoveBetween: path corners are rounded starting this far before the corner, in meters, like the blend radius on the pendant. `0.0` keeps sharp corners. |
 | `tcp_rotation` | `[pi, 0.0, 0.0]` | Fixed orientation `rx, ry, rz` in radians as on the pendant (Base feature). The default points the tool down. |
 | `speed_scaling` | `0.1` | Fraction of the maximum speed and acceleration, up to `1.0`. |
 | `motion_timeout` | `120.0` | Maximum duration of one motion, in seconds. |
@@ -513,6 +517,31 @@ success: true
 error_msg: ''
 
 Goal finished with status: SUCCEEDED
+```
+
+---
+
+# MoveBetween Action
+
+The `MoveBetween` action moves the TCP from above one object to above another along a PlanPath path,
+with the fixed orientation `tcp_rotation`. The robot stops once at the start and then follows the
+whole path to the goal without stopping at the waypoints.
+
+1. start and goal are `hover_height` above the objects, or `start_point` / `goal_point` when the id is `-1`
+2. PlanPath plans from start to goal. The path planner treats the gripper as a vertical cylinder of
+   `tool_radius`, so the TCP passes over obstacles but never beside them
+3. the corners of the path are rounded by `blend_radius` and the path is checked with CheckPoints
+4. the joint move from where the robot is to the start is planned and checked as in PlanAndExecute
+5. MoveIt 2 computes one Cartesian trajectory through all waypoints, starting where the move to the
+   start ends
+6. unless `dry_run` is set: the robot moves to the start, then follows the Cartesian trajectory
+
+Everything is planned and checked before the robot moves, so a failing step never leaves the robot
+halfway. The action fails when the start or goal is too close to an obstacle for the gripper.
+The parameters are those of PlanAndExecute. `planned_tool0_poses` shows the `tool0` poses of the path.
+
+```bash
+ros2 action send_goal /move_between mirobotics_msg/action/MoveBetween "{start_object_id: 1, goal_object_id: 2}" --feedback
 ```
 
 ---

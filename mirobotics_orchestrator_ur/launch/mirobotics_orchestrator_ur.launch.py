@@ -54,6 +54,8 @@ def generate_launch_description():
             'tcp_offset': 0.1866,
             # Fixed orientation rx, ry, rz as on the pendant, rx pi points the tool down.
             'tcp_rotation': [3.14159265, 0.0, 0.0],
+            # move_between: path corners are rounded from this distance, in meters.
+            'blend_radius': 0.02,
             'speed_scaling': 0.1,
             'motion_timeout': 120.0,
             'max_joint_travel': 3.14,
